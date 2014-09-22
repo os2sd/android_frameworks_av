@@ -81,6 +81,7 @@ SoftwareRenderer::SoftwareRenderer(
     size_t bufWidth, bufHeight;
 
     switch (mColorFormat) {
+#ifndef BCM_HARDWARE
         case OMX_COLOR_FormatYUV420Planar:
         case OMX_TI_COLOR_FormatYUV420PackedSemiPlanar:
         {
@@ -93,6 +94,7 @@ SoftwareRenderer::SoftwareRenderer(
 
             // fall through.
         }
+#endif
 #ifdef QCOM_LEGACY_OMX
         case OMX_QCOM_COLOR_FormatYVU420SemiPlanar:
         {
