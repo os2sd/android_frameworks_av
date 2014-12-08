@@ -19,6 +19,7 @@
 
 #include <utils/KeyedVector.h>
 #include <utils/String8.h>
+#include <camera/CameraParametersExtra.h>
 
 namespace android {
 
@@ -646,6 +647,19 @@ public:
     static const char KEY_WDR[];
     static const char KEY_WEATHER[];
     static const char KEY_CITYID[];
+
+    static const char KEY_DYNAMIC_RANGE_CONTROL[];
+    static const char KEY_SUPPORTED_DYNAMIC_RANGE_CONTROL[];
+    static const char KEY_PHASE_AF[];
+    static const char KEY_SUPPORTED_PHASE_AF[];
+    static const char KEY_RT_HDR[];
+    static const char KEY_SUPPORTED_RT_HDR[];
+    static const char DRC_ON[];
+    static const char DRC_OFF[];
+    static const char PAF_ON[];
+    static const char PAF_OFF[];
+    static const char RTHDR_ON[];
+    static const char RTHDR_OFF[];
 #endif
 
 #ifdef HTC_CAMERA_HARDWARE
@@ -777,7 +791,7 @@ public:
     static const char WHITE_BALANCE_CLOUDY_DAYLIGHT[];
     static const char WHITE_BALANCE_TWILIGHT[];
     static const char WHITE_BALANCE_SHADE[];
-#ifdef OPPO_CAMERA_HARDWARE
+#ifdef QCOM_HARDWARE
     static const char WHITE_BALANCE_MANUAL_CCT[];
 #endif
 
@@ -941,7 +955,7 @@ public:
     // other modes.
     static const char FOCUS_MODE_CONTINUOUS_PICTURE[];
 
-#ifdef OPPO_CAMERA_HARDWARE
+#ifdef QCOM_HARDWARE
     static const char FOCUS_MODE_MANUAL_POSITION[];
 #endif
 
@@ -1079,6 +1093,10 @@ public:
     static const char KEY_CAM_MODE[];
 
     int getMode() const;
+#endif
+
+#ifdef CAMERA_PARAMETERS_EXTRA_H
+CAMERA_PARAMETERS_EXTRA_H
 #endif
 
 private:

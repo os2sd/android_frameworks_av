@@ -410,6 +410,7 @@ status_t AudioTrack::set(
     }
 #endif
 
+#ifndef QCOM_DIRECTTRACK
     if (audio_is_linear_pcm(format)) {
         mFrameSize = channelCount * audio_bytes_per_sample(format);
         mFrameSizeAF = channelCount * sizeof(int16_t);
@@ -417,6 +418,7 @@ status_t AudioTrack::set(
         mFrameSize = sizeof(uint8_t);
         mFrameSizeAF = sizeof(uint8_t);
     }
+#endif
 
     audio_io_handle_t output = AudioSystem::getOutput(
                                     streamType,
@@ -476,6 +478,7 @@ status_t AudioTrack::set(
     }
     else {
 #endif
+
     if (cbf != NULL) {
         mAudioTrackThread = new AudioTrackThread(*this, threadCanCallJava);
         mAudioTrackThread->run("AudioTrack", ANDROID_PRIORITY_AUDIO, 0 /*stack*/);
@@ -749,8 +752,10 @@ void AudioTrack::pause()
     if (isOffloaded()) {
         if (mOutput != 0) {
             uint32_t halFrames;
+            // OffloadThread sends HAL pause in its threadLoop.. time saved
+            // here can be slightly off
             AudioSystem::getRenderPosition(mOutput, &halFrames, &mPausedPosition);
-            ALOGV("AudioTrack::pause for offload, cache current position");
+            ALOGV("AudioTrack::pause for offload, cache current position %u", mPausedPosition);
         }
     }
 }
@@ -818,8 +823,12 @@ status_t AudioTrack::setSampleRate(uint32_t rate)
     if (AudioSystem::getOutputSamplingRate(&afSamplingRate, mStreamType) != NO_ERROR) {
         return NO_INIT;
     }
-    // Resampler implementation limits input sampling rate to 2 x output sampling rate.
-    if (rate == 0 || rate > afSamplingRate*2 ) {
+    // Resampler implementation limits input sampling rate to 2/4 x output sampling rate.
+#ifdef QTI_RESAMPLER
+    if (rate == 0 || rate > afSamplingRate * 4) {
+#else
+    if (rate == 0 || rate > afSamplingRate * 2) {
+#endif
         return BAD_VALUE;
     }
 
@@ -985,6 +994,7 @@ status_t AudioTrack::getPosition(uint32_t *position) const
     AutoMutex lock(mLock);
     if (isOffloaded()) {
         uint32_t dspFrames = 0;
+        status_t status;
 
         if ((mState == STATE_PAUSED) || (mState == STATE_PAUSED_STOPPING)) {
             ALOGV("getPosition called in paused state, return cached position %u", mPausedPosition);
@@ -994,7 +1004,11 @@ status_t AudioTrack::getPosition(uint32_t *position) const
 
         if (mOutput != 0) {
             uint32_t halFrames;
-            AudioSystem::getRenderPosition(mOutput, &halFrames, &dspFrames);
+            status = AudioSystem::getRenderPosition(mOutput, &halFrames, &dspFrames);
+            if (status != NO_ERROR) {
+                ALOGW("failed to getRenderPosition for offload session");
+                return INVALID_OPERATION;
+            }
         }
         *position = dspFrames;
     } else {
@@ -1371,13 +1385,13 @@ status_t AudioTrack::obtainBuffer(Buffer* audioBuffer, int32_t waitCount)
     }
 
     const struct timespec *requested;
+    struct timespec timeout;
     if (waitCount == -1) {
         requested = &ClientProxy::kForever;
     } else if (waitCount == 0) {
         requested = &ClientProxy::kNonBlocking;
     } else if (waitCount > 0) {
         long long ms = WAIT_PERIOD_MS * (long long) waitCount;
-        struct timespec timeout;
         timeout.tv_sec = ms / 1000;
         timeout.tv_nsec = (int) (ms % 1000) * 1000000;
         requested = &timeout;
@@ -1724,6 +1738,7 @@ nsecs_t AudioTrack::processAudioBuffer(const sp<AudioTrackThread>& thread)
     }
     size_t misalignment = mProxy->getMisalignment();
     uint32_t sequence = mSequence;
+    sp<AudioTrackClientProxy> proxy = mProxy;
 
     // These fields don't need to be cached, because they are assigned only by set():
     //     mTransfer, mCbf, mUserData, mFormat, mFrameSize, mFrameSizeAF, mFlags
@@ -1764,18 +1779,11 @@ nsecs_t AudioTrack::processAudioBuffer(const sp<AudioTrackThread>& thread)
 
 
     if (waitStreamEnd) {
-        AutoMutex lock(mLock);
-
-        sp<AudioTrackClientProxy> proxy = mProxy;
-        sp<IMemory> iMem = mCblkMemory;
-
         struct timespec timeout;
         timeout.tv_sec = WAIT_STREAM_END_TIMEOUT_SEC;
         timeout.tv_nsec = 0;
 
-        mLock.unlock();
-        status_t status = mProxy->waitStreamEndDone(&timeout);
-        mLock.lock();
+        status_t status = proxy->waitStreamEndDone(&timeout);
         switch (status) {
         case NO_ERROR:
         case DEAD_OBJECT:
@@ -1789,17 +1797,22 @@ nsecs_t AudioTrack::processAudioBuffer(const sp<AudioTrackThread>& thread)
 
             mLock.unlock();
             mCbf(EVENT_STREAM_END, mUserData, NULL);
-            mLock.lock();
-            if (mState == STATE_STOPPING) {
-                mState = STATE_STOPPED;
-                if (status != DEAD_OBJECT) {
-                   return NS_INACTIVE;
+            {
+                AutoMutex lock(mLock);
+                // The previously assigned value of waitStreamEnd is no longer valid,
+                // since the mutex has been unlocked and either the callback handler
+                // or another thread could have re-started the AudioTrack during that time.
+                waitStreamEnd = mState == STATE_STOPPING;
+                if (waitStreamEnd) {
+                    mState = STATE_STOPPED;
                 }
             }
-            return 0;
-        default:
-            return 0;
+            if (waitStreamEnd && status != DEAD_OBJECT) {
+               return NS_INACTIVE;
+            }
+            break;
         }
+        return 0;
     }
 
     // if inactive, then don't run me again until re-started
@@ -1869,16 +1882,6 @@ nsecs_t AudioTrack::processAudioBuffer(const sp<AudioTrackThread>& thread)
             return NS_NEVER;
         }
 
-        if (mRetryOnPartialBuffer && !isOffloaded()) {
-            mRetryOnPartialBuffer = false;
-            if (avail < mRemainingFrames) {
-                int64_t myns = ((mRemainingFrames - avail) * 1100000000LL) / sampleRate;
-                if (ns < 0 || myns < ns) {
-                    ns = myns;
-                }
-                return ns;
-            }
-        }
 
         // Divide buffer size by 2 to take into account the expansion
         // due to 8 to 16 bit conversion: the callback must fill only half
@@ -2142,7 +2145,7 @@ void AudioTrack::DirectClient::notify(int msg) {
 
 AudioTrack::AudioTrackThread::AudioTrackThread(AudioTrack& receiver, bool bCanCallJava)
     : Thread(bCanCallJava), mReceiver(receiver), mPaused(true), mPausedInt(false), mPausedNs(0LL),
-      mIgnoreNextPausedInt(false), mCmdAckPending(false)
+      mIgnoreNextPausedInt(false)
 {
 }
 
@@ -2155,10 +2158,6 @@ bool AudioTrack::AudioTrackThread::threadLoop()
     {
         AutoMutex _l(mMyLock);
         if (mPaused) {
-            if (mCmdAckPending) {
-                mCmdAckPending = false;
-                mCmdAck.signal();
-            }
             mMyCond.wait(mMyLock);
             // caller will check for exitPending()
             return true;
@@ -2168,10 +2167,6 @@ bool AudioTrack::AudioTrackThread::threadLoop()
             mPausedInt = false;
         }
         if (mPausedInt) {
-            if (mCmdAckPending) {
-                mCmdAckPending = false;
-                mCmdAck.signal();
-            }
             if (mPausedNs > 0) {
                 (void) mMyCond.waitRelative(mMyLock, mPausedNs);
             } else {
@@ -2214,24 +2209,10 @@ void AudioTrack::AudioTrackThread::pause()
     mPaused = true;
 }
 
-void AudioTrack::AudioTrackThread::pauseSync()
-{
-    AutoMutex _l(mMyLock);
-    if (mPaused || mPausedInt)
-        return;
-
-    mPaused = true;
-    mCmdAckPending = true;
-    while (!mCmdAckPending) {
-        mCmdAck.wait(mMyLock);
-    }
-}
-
 void AudioTrack::AudioTrackThread::resume()
 {
     AutoMutex _l(mMyLock);
     mIgnoreNextPausedInt = true;
-    mCmdAckPending = false;
     if (mPaused || mPausedInt) {
         mPaused = false;
         mPausedInt = false;

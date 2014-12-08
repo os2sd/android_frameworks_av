@@ -526,6 +526,16 @@ sp<IAudioTrack> AudioFlinger::createTrack(
             goto Exit;
         }
 
+        {
+            Mutex::Autolock _l(thread->mLock);
+            // avoid two active tracks added to offload thread
+            if (thread->mType == PlaybackThread::OFFLOAD && (thread->mActiveTracks.size() > 0)) {
+                ALOGD("decline track creation for offload as an active track already exsits");
+                lStatus = BAD_VALUE;
+                goto Exit;
+            }
+        }
+
         pid_t pid = IPCThreadState::self()->getCallingPid();
 
         client = registerPid_l(pid);
@@ -556,6 +566,8 @@ sp<IAudioTrack> AudioFlinger::createTrack(
 
         track = thread->createTrack_l(client, streamType, sampleRate, format,
                 channelMask, frameCount, sharedBuffer, lSessionId, flags, tid, clientUid, &lStatus);
+        LOG_ALWAYS_FATAL_IF((lStatus == NO_ERROR) && (track == 0));
+        // we don't abort yet if lStatus != NO_ERROR; there is still work to be done regardless
 
         // move effect chain to this output thread if an effect on same session was waiting
         // for a track to be created
@@ -1578,11 +1590,11 @@ sp<IAudioRecord> AudioFlinger::openRecord(
         goto Exit;
     }
 #else
-#if defined(QCOM_HARDWARE)
+#ifdef QCOM_HARDWARE
     if (format != AUDIO_FORMAT_PCM_16_BIT &&
             !audio_is_compress_voip_format(format) &&
             !audio_is_compress_capture_format(format)) {
-#else 
+#else
     if (format != AUDIO_FORMAT_PCM_16_BIT) {
 #endif
         ALOGE("openRecord() invalid format %d", format);
@@ -1926,13 +1938,16 @@ audio_io_handle_t AudioFlinger::openOutput(audio_module_handle_t module,
             thread = new MixerThread(this, output, id, *pDevices);
             ALOGV("openOutput() created mixer output: ID %d thread %p", id, thread);
         }
+
+
+#ifdef QCOM_DIRECTTRACK
         if (thread != NULL) {
+#endif
             mPlaybackThreads.add(id, thread);
 #ifdef QCOM_DIRECTTRACK
             thread->mOutputFlags = flags;
-#endif
         }
-
+#endif
         if (pSamplingRate != NULL) {
             *pSamplingRate = config.sample_rate;
         }
@@ -1942,12 +1957,14 @@ audio_io_handle_t AudioFlinger::openOutput(audio_module_handle_t module,
         if (pChannelMask != NULL) {
             *pChannelMask = config.channel_mask;
         }
+#ifdef QCOM_DIRECTTRACK
         if (thread != NULL) {
+#endif
             if (pLatencyMs != NULL) *pLatencyMs = thread->latency();
             // notify client processes of the new output creation
             thread->audioConfigChanged_l(AudioSystem::OUTPUT_OPENED);
-        }
 #ifdef QCOM_DIRECTTRACK
+        }
         else {
             *pLatencyMs = 0;
             if ((flags & AUDIO_OUTPUT_FLAG_LPA) || (flags & AUDIO_OUTPUT_FLAG_TUNNEL)) {

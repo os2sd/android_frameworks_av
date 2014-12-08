@@ -89,9 +89,7 @@ status_t CameraClient::initialize(camera_module_t *module) {
 
     // Enable zoom, error, focus, and metadata messages by default
     enableMsgType(CAMERA_MSG_ERROR | CAMERA_MSG_ZOOM | CAMERA_MSG_FOCUS
-#ifndef CAMERA_MSG_MGMT
                   | CAMERA_MSG_PREVIEW_METADATA 
-#endif
 #ifndef OMAP_ICS_CAMERA
                   | CAMERA_MSG_FOCUS_MOVE
 #endif
@@ -361,15 +359,14 @@ status_t CameraClient::setPreviewCallbackTarget(
 
 // start preview mode
 status_t CameraClient::startPreview() {
-#ifdef CAMERA_MSG_MGMT
-    enableMsgType(CAMERA_MSG_PREVIEW_METADATA);
-#endif
+    Mutex::Autolock lock(mLock);
     LOG1("startPreview (pid %d)", getCallingPid());
     return startCameraMode(CAMERA_PREVIEW_MODE);
 }
 
 // start recording mode
 status_t CameraClient::startRecording() {
+    Mutex::Autolock lock(mLock);
     LOG1("startRecording (pid %d)", getCallingPid());
     return startCameraMode(CAMERA_RECORDING_MODE);
 }
@@ -377,7 +374,6 @@ status_t CameraClient::startRecording() {
 // start preview or recording
 status_t CameraClient::startCameraMode(camera_mode mode) {
     LOG1("startCameraMode(%d)", mode);
-    Mutex::Autolock lock(mLock);
     status_t result = checkPidAndHardware();
     if (result != NO_ERROR) return result;
 
@@ -455,9 +451,6 @@ status_t CameraClient::startRecordingMode() {
 // stop preview mode
 void CameraClient::stopPreview() {
     LOG1("stopPreview (pid %d)", getCallingPid());
-#ifdef CAMERA_MSG_MGMT
-    disableMsgType(CAMERA_MSG_PREVIEW_METADATA);
-#endif
     Mutex::Autolock lock(mLock);
     if (checkPidAndHardware() != NO_ERROR) return;
 
@@ -595,9 +588,6 @@ status_t CameraClient::takePicture(int msgType) {
 
 #if defined(OMAP_ICS_CAMERA) || defined(OMAP_ENHANCEMENT_BURST_CAPTURE)
     picMsgType |= CAMERA_MSG_COMPRESSED_BURST_IMAGE;
-#endif
-#ifdef CAMERA_MSG_MGMT
-    disableMsgType(CAMERA_MSG_PREVIEW_METADATA);
 #endif
     enableMsgType(picMsgType);
 #ifdef QCOM_HARDWARE

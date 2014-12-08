@@ -44,7 +44,9 @@
 namespace android {
 
 static const int64_t kMinStreamableFileSizeInBytes = 5 * 1024 * 1024;
-static const int64_t kMax32BitFileSize = 0x007fffffffLL;
+static const int64_t kMax32BitFileSize = 0x00ffffffffLL; // 2^32-1 : max FAT32
+                                                         // filesystem file size
+                                                         // used by most SD cards
 static const int64_t kMax64BitFileSize = 0x00ffffffffLL; //fat32 max size limited to 4GB
 static const uint8_t kNalUnitTypeSeqParamSet = 0x07;
 static const uint8_t kNalUnitTypePicParamSet = 0x08;
@@ -351,7 +353,8 @@ MPEG4Writer::MPEG4Writer(const char *filename)
       mLatitudex10000(0),
       mLongitudex10000(0),
       mAreGeoTagsAvailable(false),
-      mStartTimeOffsetMs(-1) {
+      mStartTimeOffsetMs(-1),
+      mHFRRatio(1) {
 
     mFd = open(filename, O_CREAT | O_LARGEFILE | O_TRUNC | O_RDWR, S_IRUSR | S_IWUSR);
     if (mFd >= 0) {
@@ -376,7 +379,8 @@ MPEG4Writer::MPEG4Writer(int fd)
       mLatitudex10000(0),
       mLongitudex10000(0),
       mAreGeoTagsAvailable(false),
-      mStartTimeOffsetMs(-1) {
+      mStartTimeOffsetMs(-1),
+      mHFRRatio(1) {
 }
 
 MPEG4Writer::~MPEG4Writer() {
@@ -452,6 +456,15 @@ status_t MPEG4Writer::addSource(const sp<MediaSource> &source) {
             mime);
         return ERROR_UNSUPPORTED;
     }
+    if ((isVideo && strcasecmp(MEDIA_MIMETYPE_VIDEO_MPEG4, mime)
+                && strcasecmp(MEDIA_MIMETYPE_VIDEO_H263, mime)
+                && strcasecmp(MEDIA_MIMETYPE_VIDEO_AVC, mime)) ||
+          (isAudio && strcasecmp(MEDIA_MIMETYPE_AUDIO_AAC, mime)
+                   && strcasecmp(MEDIA_MIMETYPE_AUDIO_AMR_NB, mime)
+                   && strcasecmp(MEDIA_MIMETYPE_AUDIO_AMR_WB, mime))) {
+         ALOGE("Track (%s) is not supported in MP4 container.", mime);
+         return ERROR_UNSUPPORTED;
+    }
 
     // At this point, we know the track to be added is either
     // video or audio. Thus, we only need to check whether it
@@ -471,6 +484,8 @@ status_t MPEG4Writer::addSource(const sp<MediaSource> &source) {
     // Go ahead to add the track.
     Track *track = new Track(this, source, 1 + mTracks.size());
     mTracks.push_back(track);
+
+    mHFRRatio = ExtendedUtils::HFR::getHFRRatio(meta);
 
     return OK;
 }
@@ -512,7 +527,7 @@ int64_t MPEG4Writer::estimateMoovBoxSize(int32_t bitRate) {
 
     // If the estimation is wrong, we will pay the price of wasting
     // some reserved space. This should not happen so often statistically.
-    static const int32_t factor = mUse32BitOffset? 1: 2;
+    int32_t factor = mUse32BitOffset? 1: 2;
     static const int64_t MIN_MOOV_BOX_SIZE = 3 * 1024;  // 3 KB
     static const int64_t MAX_MOOV_BOX_SIZE = (180 * 3000000 * 6LL / 8000);
     int64_t size = MIN_MOOV_BOX_SIZE;
@@ -609,8 +624,6 @@ status_t MPEG4Writer::start(MetaData *param) {
         mIsRealTimeRecording = isRealTimeRecording;
     }
 
-    mStartTimestampUs = -1;
-
     if (mStarted) {
         if (mPaused) {
             mPaused = false;
@@ -618,6 +631,8 @@ status_t MPEG4Writer::start(MetaData *param) {
         }
         return OK;
     }
+
+    mStartTimestampUs = -1;
 
     if (!param ||
         !param->findInt32(kKeyTimeScale, &mTimeScale)) {
@@ -867,11 +882,11 @@ status_t MPEG4Writer::reset() {
     // Fix up the size of the 'mdat' chunk.
     if (mUse32BitOffset) {
         lseek64(mFd, mMdatOffset, SEEK_SET);
-        int32_t size = htonl(static_cast<int32_t>(mOffset - mMdatOffset));
+        uint32_t size = htonl(static_cast<uint32_t>(mOffset - mMdatOffset));
         ::write(mFd, &size, 4);
     } else {
         lseek64(mFd, mMdatOffset + 8, SEEK_SET);
-        int64_t size = mOffset - mMdatOffset;
+        uint64_t size = mOffset - mMdatOffset;
         size = hton64(size);
         ::write(mFd, &size, 8);
     }
@@ -939,7 +954,7 @@ void MPEG4Writer::writeMvhdBox(int64_t durationUs) {
     writeInt32(0);             // version=0, flags=0
     writeInt32(now);           // creation time
     writeInt32(now);           // modification time
-    writeInt32(mTimeScale);    // mvhd timescale
+    writeInt32(mTimeScale / mHFRRatio);    // mvhd timescale
     int32_t duration = (durationUs * mTimeScale + 5E5) / 1E6;
     writeInt32(duration);
     writeInt32(0x10000);       // rate: 1.0
@@ -1049,6 +1064,44 @@ static void StripStartcode(MediaBuffer *buffer) {
         return;
     }
 
+#if defined (OMAP_ENHANCEMENT) && defined (TARGET_OMAP3)
+    uint8_t *data =
+        (uint8_t *)buffer->data() + buffer->range_offset();
+    size_t size = buffer->range_length();
+    uint8_t *tmp = data;
+    uint8_t *foundStartData = data;
+    size_t bytesLeft = size;
+    size_t nal_size;
+    bool foundStartCode = false;
+
+    while (bytesLeft > 4) {
+        if (!memcmp("\x00\x00\x00\x01", tmp, 4)) {
+            if (tmp - foundStartData) {
+                if (foundStartCode == true) {
+                    nal_size = tmp - foundStartData - 4;
+                    foundStartData[0] = nal_size >> 24;
+                    foundStartData[1] = (nal_size >> 16) & 0xFF;
+                    foundStartData[2] = (nal_size >> 8) & 0xFF;
+                    foundStartData[3] = nal_size & 0xFF;
+                }
+                foundStartData = tmp;
+            }
+            foundStartCode = true;
+            tmp += 4;
+            bytesLeft -= 4;
+        } else {
+            bytesLeft--;
+            tmp++;
+        }
+    }
+    if (foundStartCode == true) {
+        nal_size = data + size - foundStartData - 4;
+        foundStartData[0] = nal_size >> 24;
+        foundStartData[1] = (nal_size >> 16) & 0xFF;
+        foundStartData[2] = (nal_size >> 8) & 0xFF;
+        foundStartData[3] = nal_size & 0xFF;
+    }
+#else
     const uint8_t *ptr =
         (const uint8_t *)buffer->data() + buffer->range_offset();
 
@@ -1056,6 +1109,7 @@ static void StripStartcode(MediaBuffer *buffer) {
         buffer->set_range(
                 buffer->range_offset() + 4, buffer->range_length() - 4);
     }
+#endif
 }
 
 off64_t MPEG4Writer::addLengthPrefixedSample_l(MediaBuffer *buffer) {
@@ -1564,9 +1618,13 @@ void MPEG4Writer::writeChunkToFile(Chunk* chunk) {
     while (!chunk->mSamples.empty()) {
         List<MediaBuffer *>::iterator it = chunk->mSamples.begin();
 
+#if defined (OMAP_ENHANCEMENT) && defined (TARGET_OMAP3)
+        off64_t offset = addSample_l(*it);
+#else
         off64_t offset = chunk->mTrack->isAvc()
                                 ? addLengthPrefixedSample_l(*it)
                                 : addSample_l(*it);
+#endif
 
         if (isFirstSample) {
             chunk->mTrack->addChunkOffset(offset);
@@ -1760,9 +1818,6 @@ status_t MPEG4Writer::Track::start(MetaData *params) {
     pthread_attr_destroy(&attr);
 
     mHFRRatio = ExtendedUtils::HFR::getHFRRatio(mMeta);
-    // Workaround until HFR is fully functional
-    if (!mHFRRatio)
-	mHFRRatio = 1;
 
     return OK;
 }
@@ -2090,6 +2145,10 @@ status_t MPEG4Writer::Track::threadEntry() {
     uint32_t previousSampleSize = 0;  // Size of the previous sample
     int64_t previousPausedDurationUs = 0;
     int64_t timestampUs = 0;
+#if (defined(OMAP_ENHANCEMENT) && defined(TARGET_OMAP3))
+    uint8_t *copy_spspps = 0;
+    int32_t copy_spspps_size = 0;
+#endif
     int64_t cttsOffsetTimeUs = 0;
     int64_t currCttsOffsetTimeTicks = 0;   // Timescale based ticks
     int64_t lastCttsOffsetTimeTicks = -1;  // Timescale based ticks
@@ -2155,44 +2214,50 @@ status_t MPEG4Writer::Track::threadEntry() {
             mGotAllCodecSpecificData = true;
             continue;
         }
-#if defined(OMAP_ENHANCEMENT) && defined(TARGET_OMAP3)
+
+#if (defined(OMAP_ENHANCEMENT) && defined(TARGET_OMAP3))
         else if (mIsAvc && count < 3) {
             size_t size = buffer->range_length();
+            size_t start_code_size = 0;
+
+            CHECK(!mGotAllCodecSpecificData);
+
+            start_code_size = memcmp("\x00\x00\x00\x01",
+                    (uint8_t *)buffer->data(), 4) ? 4 : 0;
 
             switch (count) {
                 case 1:
                 {
-                    CHECK_EQ(mCodecSpecificData, (void *)NULL);
-                    mCodecSpecificData = malloc(size + 8);
-                    uint8_t *header = (uint8_t *)mCodecSpecificData;
-                    header[0] = 1;
-                    header[1] = 0x42;  // profile
-                    header[2] = 0x80;
-                    header[3] = 0x1e;  // level
-                    header[4] = 0xfc | 3;
-                    header[5] = 0xe0 | 1;
-                    header[6] = size >> 8;
-                    header[7] = size & 0xff;
-                    memcpy(&header[8],
-                            (const uint8_t *)buffer->data() + buffer->range_offset(),
+                    copy_spspps = (uint8_t *)malloc(size + start_code_size);
+                    copy_spspps_size = size + start_code_size;
+                    if (start_code_size)
+                        memcpy(copy_spspps,
+                                "\x00\x00\x00\x01", start_code_size);
+                    memcpy((uint8_t *)copy_spspps + start_code_size,
+                            (const uint8_t *)buffer->data()
+                                + buffer->range_offset(),
                             size);
-
-                    mCodecSpecificDataSize = size + 8;
                     break;
                 }
 
                 case 2:
                 {
-                    size_t offset = mCodecSpecificDataSize;
-                    mCodecSpecificDataSize += size + 3;
-                    mCodecSpecificData = realloc(mCodecSpecificData, mCodecSpecificDataSize);
-                    uint8_t *header = (uint8_t *)mCodecSpecificData;
-                    header[offset] = 1;
-                    header[offset + 1] = size >> 8;
-                    header[offset + 2] = size & 0xff;
-                    memcpy(&header[offset + 3],
-                            (const uint8_t *)buffer->data() + buffer->range_offset(),
+                    size_t offset = copy_spspps_size;
+                    copy_spspps_size += (size + start_code_size);
+                    copy_spspps = (uint8_t *)realloc(copy_spspps, copy_spspps_size);
+                    if (start_code_size)
+                        memcpy(&copy_spspps[offset],
+                                "\x00\x00\x00\x01", start_code_size);
+                    memcpy(&copy_spspps[offset + start_code_size],
+                            (const uint8_t *)buffer->data()
+                                + buffer->range_offset(),
                             size);
+                    status_t err = makeAVCCodecSpecificData(
+                            copy_spspps, copy_spspps_size);
+                    CHECK_EQ((status_t)OK, err);
+                    free(copy_spspps);
+                    copy_spspps = NULL;
+                    mGotAllCodecSpecificData = true;
                     break;
                 }
             }
@@ -2203,42 +2268,44 @@ status_t MPEG4Writer::Track::threadEntry() {
             continue;
 
         } else if (mCodecSpecificData == NULL && mIsMPEG4) {
-            const uint8_t *data =
-                (const uint8_t *)buffer->data() + buffer->range_offset();
+            CHECK(!mGotAllCodecSpecificData);
+            mCodecSpecificDataSize = buffer->range_length();
+            mCodecSpecificData = malloc(mCodecSpecificDataSize);
+            memcpy(mCodecSpecificData,
+                    (const uint8_t *)buffer->data()
+                        + buffer->range_offset(),
+                   buffer->range_length());
+            buffer->release();
+            buffer = NULL;
 
-            const size_t size = buffer->range_length();
-
-            size_t offset = 0;
-            while (offset + 3 < size) {
-                if (data[offset] == 0x00 && data[offset + 1] == 0x00
-                    && data[offset + 2] == 0x01 && data[offset + 3] == 0xb6) {
-                    break;
-                }
-
-                ++offset;
-            }
-
-            // CHECK(offset + 3 < size);
-            if (offset + 3 >= size) {
-                // XXX assume the entire first chunk of data is the codec specific
-                // data.
-                offset = size;
-            }
-
-            mCodecSpecificDataSize = offset;
-            mCodecSpecificData = malloc(offset);
-            memcpy(mCodecSpecificData, data, offset);
-
-            buffer->set_range(buffer->range_offset() + offset, size - offset);
+            mGotAllCodecSpecificData = true;
+            continue;
         }
 #endif
 
         // Make a deep copy of the MediaBuffer and Metadata and release
         // the original as soon as we can
+#if defined (OMAP_ENHANCEMENT) && defined (TARGET_OMAP3)
+        MediaBuffer *copy;
+        size_t start_code_size = 0;
+
+        if (mIsAvc) {
+            start_code_size = memcmp("\x00\x00\x00\x01",
+                    (uint8_t *)buffer->data(), 4) ? 4 : 0;
+        }
+        copy = new MediaBuffer(buffer->range_length() + start_code_size);
+        if (start_code_size)
+            memcpy(copy->data(), "\x00\x00\x00\x01", start_code_size);
+        memcpy((uint8_t *)copy->data() + start_code_size,
+                (uint8_t *)buffer->data() + buffer->range_offset(),
+                buffer->range_length());
+        copy->set_range(0, buffer->range_length() + start_code_size);
+#else
         MediaBuffer *copy = new MediaBuffer(buffer->range_length());
         memcpy(copy->data(), (uint8_t *)buffer->data() + buffer->range_offset(),
                 buffer->range_length());
         copy->set_range(0, buffer->range_length());
+#endif
         meta_data = new MetaData(*buffer->meta_data().get());
         buffer->release();
         buffer = NULL;
@@ -2246,6 +2313,7 @@ status_t MPEG4Writer::Track::threadEntry() {
         if (mIsAvc) StripStartcode(copy);
 
         size_t sampleSize = copy->range_length();
+#if !defined (OMAP_ENHANCEMENT) || !defined (TARGET_OMAP3)
         if (mIsAvc) {
             if (mOwner->useNalLengthFour()) {
                 sampleSize += 4;
@@ -2253,6 +2321,7 @@ status_t MPEG4Writer::Track::threadEntry() {
                 sampleSize += 2;
             }
         }
+#endif
 
         // Max file size or duration handling
         mMdatSizeBytes += sampleSize;
@@ -2285,9 +2354,9 @@ status_t MPEG4Writer::Track::threadEntry() {
         }
 
         timestampUs -= previousPausedDurationUs;
-#ifndef OMAP_ENHANCEMENT
+
         CHECK_GE(timestampUs, 0ll);
-#endif
+
         if (!mIsAudio) {
             /*
              * Composition time: timestampUs
@@ -2299,8 +2368,13 @@ status_t MPEG4Writer::Track::threadEntry() {
 
             decodingTimeUs -= previousPausedDurationUs;
             cttsOffsetTimeUs =
+#ifdef QCOM_HARDWARE
                     timestampUs - decodingTimeUs;
             CHECK_GE(kMaxCttsOffsetTimeUs, decodingTimeUs - timestampUs);
+#else
+                    timestampUs + kMaxCttsOffsetTimeUs - decodingTimeUs;
+            CHECK_GE(cttsOffsetTimeUs, 0ll);
+#endif
             timestampUs = decodingTimeUs;
             ALOGV("decoding time: %lld and ctts offset time: %lld",
                 timestampUs, cttsOffsetTimeUs);
@@ -2364,7 +2438,9 @@ status_t MPEG4Writer::Track::threadEntry() {
         if (currDurationTicks < 0ll) {
             ALOGE("timestampUs %lld < lastTimestampUs %lld for %s track",
                 timestampUs, lastTimestampUs, mIsAudio? "Audio": "Video");
-            return UNKNOWN_ERROR;
+            err = UNKNOWN_ERROR;
+            mSource->notifyError(err);
+            return err;
         }
 
         mStszTableEntries->add(htonl(sampleSize));
@@ -2405,9 +2481,12 @@ status_t MPEG4Writer::Track::threadEntry() {
 
         // use File write in seperate thread for video only recording
         if (!hasMultipleTracks && mIsAudio) {
+#if defined (OMAP_ENHANCEMENT) && defined (TARGET_OMAP3)
+            off64_t offset = mOwner->addSample_l(copy);
+#else
             off64_t offset = mIsAvc? mOwner->addLengthPrefixedSample_l(copy)
                                  : mOwner->addSample_l(copy);
-
+#endif
             uint32_t count = (mOwner->use32BitFileOffset()
                         ? mStcoTableEntries->count()
                         : mCo64TableEntries->count());
@@ -2645,7 +2724,7 @@ void MPEG4Writer::Track::bufferChunk(int64_t timestampUs) {
 }
 
 int64_t MPEG4Writer::Track::getDurationUs() const {
-    return mTrackDurationUs * mHFRRatio;
+    return mTrackDurationUs;
 }
 
 int64_t MPEG4Writer::Track::getEstimatedTrackSizeBytes() const {
@@ -2836,8 +2915,10 @@ void MPEG4Writer::Track::writeMp4aEsdsBox() {
 
     mOwner->writeInt16(0x03);  // XXX
     mOwner->writeInt8(0x00);   // buffer size 24-bit
-    mOwner->writeInt32(96000); // max bit rate
-    mOwner->writeInt32(96000); // avg bit rate
+    int32_t bitRate;
+    bool success = mMeta->findInt32(kKeyBitRate, &bitRate);
+    mOwner->writeInt32(success ? bitRate : 96000); // max bit rate
+    mOwner->writeInt32(success ? bitRate : 96000); // avg bit rate
 
     mOwner->writeInt8(0x05);   // DecoderSpecificInfoTag
     mOwner->writeInt8(mCodecSpecificDataSize);
@@ -2970,7 +3051,7 @@ void MPEG4Writer::Track::writeMdhdBox(uint32_t now) {
 
     int32_t timeScale = mTimeScale / mHFRRatio;
     mOwner->writeInt32(timeScale);    // media timescale
-    int32_t mdhdDuration = (trakDurationUs * timeScale + 5E5) / 1E6;
+    int32_t mdhdDuration = (trakDurationUs * mTimeScale + 5E5) / 1E6;
     mOwner->writeInt32(mdhdDuration);  // use media timescale
     // Language follows the three letter standard ISO-639-2/T
     // 'e', 'n', 'g' for "English", for instance.

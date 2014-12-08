@@ -39,6 +39,11 @@
 #endif
 #ifdef ENABLE_AV_ENHANCEMENTS
 #include <QCMediaDefs.h>
+#include <QCMetaData.h>
+#endif
+
+#if defined(ENABLE_AV_ENHANCEMENTS) || defined(ENABLE_OFFLOAD_ENHANCEMENTS)
+#include "include/ExtendedUtils.h"
 #endif
 
 namespace android {
@@ -449,17 +454,20 @@ void convertMessageToMetaData(const sp<AMessage> &msg, sp<MetaData> &meta) {
     sp<ABuffer> csd0;
     if (msg->findBuffer("csd-0", &csd0)) {
         if (mime.startsWith("video/")) { // do we need to be stricter than this?
-            sp<ABuffer> csd1;
-            if (msg->findBuffer("csd-1", &csd1)) {
-                char avcc[1024]; // that oughta be enough, right?
-                size_t outsize = reassembleAVCC(csd0, csd1, avcc);
-                meta->setData(kKeyAVCC, kKeyAVCC, avcc, outsize);
-            } else {
+            if (!strcasecmp(mime.c_str(), MEDIA_MIMETYPE_VIDEO_AVC)) {
+                sp<ABuffer> csd1;
+                if (msg->findBuffer("csd-1", &csd1)) {
+                    char avcc[1024]; // that oughta be enough, right?
+                    size_t outsize = reassembleAVCC(csd0, csd1, avcc);
+                    meta->setData(kKeyAVCC, kKeyAVCC, avcc, outsize);
+                }
+            } else if (!strcasecmp(mime.c_str(), MEDIA_MIMETYPE_VIDEO_MPEG4)) {
                 int csd0size = csd0->size();
                 char esds[csd0size + 31];
                 reassembleESDS(csd0, esds);
                 meta->setData(kKeyESDS, kKeyESDS, esds, sizeof(esds));
             }
+
         } else if (mime.startsWith("audio/")) {
             int csd0size = csd0->size();
             char esds[csd0size + 31];
@@ -501,6 +509,7 @@ status_t sendMetaDataToHal(sp<MediaPlayerBase::AudioSink>& sink,
     int32_t delaySamples = 0;
     int32_t paddingSamples = 0;
     int32_t isADTS = 0;
+    int32_t minBlkSize, maxBlkSize, minFrmSize, maxFrmSize; //FLAC params
 
     AudioParameter param = AudioParameter();
 
@@ -522,6 +531,20 @@ status_t sendMetaDataToHal(sp<MediaPlayerBase::AudioSink>& sink,
     if (meta->findInt32(kKeyIsADTS, &isADTS)) {
         param.addInt(String8(AUDIO_OFFLOAD_CODEC_FORMAT), 0x02 /*SND_AUDIOSTREAMFORMAT_MP4ADTS*/);
     }
+#if defined(ENABLE_AV_ENHANCEMENTS) && defined(QTI_FLAC_DECODER)
+    if (meta->findInt32(kKeyMinBlkSize, &minBlkSize)) {
+        param.addInt(String8(AUDIO_OFFLOAD_CODEC_FLAC_MIN_BLK_SIZE), minBlkSize);
+    }
+    if (meta->findInt32(kKeyMaxBlkSize, &maxBlkSize)) {
+        param.addInt(String8(AUDIO_OFFLOAD_CODEC_FLAC_MAX_BLK_SIZE), maxBlkSize);
+    }
+    if (meta->findInt32(kKeyMinFrmSize, &minFrmSize)) {
+        param.addInt(String8(AUDIO_OFFLOAD_CODEC_FLAC_MIN_FRAME_SIZE), minFrmSize);
+    }
+    if (meta->findInt32(kKeyMaxFrmSize, &maxFrmSize)) {
+        param.addInt(String8(AUDIO_OFFLOAD_CODEC_FLAC_MAX_FRAME_SIZE), maxFrmSize);
+    }
+#endif
 
     ALOGV("sendMetaDataToHal: bitRate %d, sampleRate %d, chanMask %d,"
           "delaySample %d, paddingSample %d", bitRate, sampleRate,
@@ -544,6 +567,7 @@ static const struct mime_conv_t mimeLookup[] = {
     { MEDIA_MIMETYPE_AUDIO_AAC,         AUDIO_FORMAT_AAC },
     { MEDIA_MIMETYPE_AUDIO_VORBIS,      AUDIO_FORMAT_VORBIS },
 #ifdef ENABLE_AV_ENHANCEMENTS
+    { MEDIA_MIMETYPE_AUDIO_FLAC,        AUDIO_FORMAT_FLAC },
     { MEDIA_MIMETYPE_AUDIO_AC3,         AUDIO_FORMAT_AC3 },
     { MEDIA_MIMETYPE_AUDIO_AMR_WB_PLUS, AUDIO_FORMAT_AMR_WB_PLUS },
     { MEDIA_MIMETYPE_AUDIO_DTS,         AUDIO_FORMAT_DTS },
@@ -551,6 +575,10 @@ static const struct mime_conv_t mimeLookup[] = {
     { MEDIA_MIMETYPE_AUDIO_EVRC,        AUDIO_FORMAT_EVRC },
     { MEDIA_MIMETYPE_AUDIO_QCELP,       AUDIO_FORMAT_QCELP },
     { MEDIA_MIMETYPE_AUDIO_WMA,         AUDIO_FORMAT_WMA },
+    { MEDIA_MIMETYPE_AUDIO_MPEG_LAYER_II, AUDIO_FORMAT_MP2 },
+#ifdef QTI_FLAC_DECODER
+    { MEDIA_MIMETYPE_CONTAINER_QTIFLAC, AUDIO_FORMAT_FLAC },
+#endif
 #endif
     { 0, AUDIO_FORMAT_INVALID }
 };
@@ -588,18 +616,28 @@ bool canOffloadStream(const sp<MetaData>& meta, bool hasVideo, const sp<MetaData
 
     audio_offload_info_t info = AUDIO_INFO_INITIALIZER;
 
+    int32_t bitWidth = 16;
+#if defined(ENABLE_AV_ENHANCEMENTS) || defined(ENABLE_OFFLOAD_ENHANCEMENTS)
+    if (!meta->findInt32(kKeySampleBits, &bitWidth)) {
+        ALOGV("bits per sample not set, using default %d", bitWidth);
+    }
+    info.bit_width = bitWidth >= 24 ? 24 : bitWidth;
+#endif
+
     info.format = AUDIO_FORMAT_INVALID;
     if (mapMimeToAudioFormat(info.format, mime) != OK) {
         ALOGE(" Couldn't map mime type \"%s\" to a valid AudioSystem::audio_format !", mime);
         return false;
-    } else {
-#ifdef QCOM_HARDWARE
+    } else if (audio_is_linear_pcm(info.format) || audio_is_offload_pcm(info.format)) {
+#if defined(QCOM_HARDWARE) || defined(ENABLE_OFFLOAD_ENHANCEMENTS)
         // Override audio format for PCM offload
-        if (info.format == AUDIO_FORMAT_PCM_16_BIT) {
+        if (bitWidth >= 24) {
+            ALOGD("24-bit PCM offload enabled");
+            info.format = AUDIO_FORMAT_PCM_24_BIT_OFFLOAD;
+        } else {
             info.format = AUDIO_FORMAT_PCM_16_BIT_OFFLOAD;
         }
 #endif
-        ALOGV("Mime type \"%s\" mapped to audio_format %d", mime, info.format);
     }
 
     if (AUDIO_FORMAT_INVALID == info.format) {
@@ -607,6 +645,8 @@ bool canOffloadStream(const sp<MetaData>& meta, bool hasVideo, const sp<MetaData
         ALOGE("mime type \"%s\" not a known audio format", mime);
         return false;
     }
+
+    ALOGV("Mime type \"%s\" mapped to audio_format 0x%x", mime, info.format);
 
     // check whether it is ELD/LD/main content -> no offloading
     // FIXME: this should depend on audio DSP capabilities. mapMimeToAudioFormat() should use the
@@ -626,7 +666,7 @@ bool canOffloadStream(const sp<MetaData>& meta, bool hasVideo, const sp<MetaData
     info.sample_rate = srate;
 
     int32_t cmask = 0;
-    if (!meta->findInt32(kKeyChannelMask, &cmask)) {
+    if (!meta->findInt32(kKeyChannelMask, &cmask) || (cmask == 0)) {
         ALOGV("track of type '%s' does not publish channel mask", mime);
 
         // Try a channel count instead
@@ -651,14 +691,23 @@ bool canOffloadStream(const sp<MetaData>& meta, bool hasVideo, const sp<MetaData
      }
     info.bit_rate = brate;
 
-
     info.stream_type = streamType;
     info.has_video = hasVideo;
     info.is_streaming = isStreaming;
 
     // Check if offload is possible for given format, stream type, sample rate,
     // bit rate, duration, video and streaming
-    return AudioSystem::isOffloadSupported(info);
+    bool canOffload = AudioSystem::isOffloadSupported(info);
+
+#if defined(ENABLE_AV_ENHANCEMENTS) || defined(ENABLE_OFFLOAD_ENHANCEMENTS)
+    // If we can't offload a 24-bit stream, we need to downgrade
+    // it to 16-bits. Codec will reconfigure for new bit width.
+    if (audio_is_offload_pcm(info.format)) {
+        ExtendedUtils::updateOutputBitWidth(meta, canOffload);
+    }
+#endif
+
+    return canOffload;
 }
 
 }  // namespace android

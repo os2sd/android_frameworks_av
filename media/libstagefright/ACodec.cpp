@@ -377,6 +377,7 @@ ACodec::ACodec()
       mIsEncoder(false),
       mUseMetadataOnEncoderOutput(false),
       mShutdownInProgress(false),
+      mIsConfiguredForAdaptivePlayback(false),
       mEncoderDelay(0),
       mEncoderPadding(0),
       mChannelMaskPresent(false),
@@ -384,7 +385,8 @@ ACodec::ACodec()
       mDequeueCounter(0),
       mStoreMetaDataInOutputBuffers(false),
       mMetaDataBuffersToSubmit(0),
-      mRepeatFrameDelayUs(-1ll) {
+      mRepeatFrameDelayUs(-1ll),
+      mMaxPtsGapUs(-1l) {
     mUninitializedState = new UninitializedState(this);
     mLoadedState = new LoadedState(this);
     mLoadedToIdleState = new LoadedToIdleState(this);
@@ -660,6 +662,14 @@ status_t ACodec::configureOutputBuffersFromNativeWindow(
                 strerror(-err), -err);
         return err;
     }
+
+#ifdef QCOM_HARDWARE
+    //add an extra buffer to display queue to get around dequeue+wait
+    //blocking too long (more than 1 Vsync) in case BufferQeuue is in
+    //sync-mode and advertizes only 1 buffer
+    (*minUndequeuedBuffers)++;
+    ALOGI("NOTE: Overriding minUndequeuedBuffers to %lu",*minUndequeuedBuffers);
+#endif
 
     // XXX: Is this the right logic to use?  It's not clear to me what the OMX
     // buffer counts refer to - how do they account for the renderer holding on
@@ -1029,8 +1039,13 @@ status_t ACodec::setComponentRole(
             "video_decoder.vp9", "video_encoder.vp9" },
         { MEDIA_MIMETYPE_AUDIO_RAW,
             "audio_decoder.raw", "audio_encoder.raw" },
+#ifdef QTI_FLAC_DECODER
+        { MEDIA_MIMETYPE_AUDIO_FLAC,
+            "audio_decoder.raw", NULL },
+#else
         { MEDIA_MIMETYPE_AUDIO_FLAC,
             "audio_decoder.flac", "audio_encoder.flac" },
+#endif
         { MEDIA_MIMETYPE_AUDIO_MSGSM,
             "audio_decoder.gsm", "audio_encoder.gsm" },
     };
@@ -1168,6 +1183,10 @@ status_t ACodec::configureCodec(
                     &mRepeatFrameDelayUs)) {
             mRepeatFrameDelayUs = -1ll;
         }
+
+        if (!msg->findInt64("max-pts-gap-to-encoder", &mMaxPtsGapUs)) {
+            mMaxPtsGapUs = -1l;
+        }
     }
 
     // Always try to enable dynamic output buffers on native surface
@@ -1176,6 +1195,7 @@ status_t ACodec::configureCodec(
             obj != NULL;
     mStoreMetaDataInOutputBuffers = false;
     bool bAdaptivePlaybackMode = false;
+    mIsConfiguredForAdaptivePlayback = false;
     if (!encoder && video && haveNativeWindow) {
         int32_t preferAdaptive = 0;
         if (msg->findInt32("prefer-adaptive-playback", &preferAdaptive)
@@ -1230,6 +1250,7 @@ status_t ACodec::configureCodec(
                         "[%s] prepareForAdaptivePlayback failed w/ err %d",
                         mComponentName.c_str(), err);
                 bAdaptivePlaybackMode = (err == OK);
+                mIsConfiguredForAdaptivePlayback = (err == OK);
             }
             // if Adaptive mode was tried first and codec failed it, try dynamic mode
             if (err != OK && preferAdaptive) {
@@ -1238,12 +1259,14 @@ status_t ACodec::configureCodec(
                     ALOGE("[%s] storeMetaDataInBuffers failed w/ err %d",
                           mComponentName.c_str(), err);
                 }
+                mIsConfiguredForAdaptivePlayback = (err == OK);
             }
             // allow failure
             err = OK;
         } else {
             ALOGV("[%s] storeMetaDataInBuffers succeeded", mComponentName.c_str());
             mStoreMetaDataInOutputBuffers = true;
+            mIsConfiguredForAdaptivePlayback = true;
         }
 
         ALOGI("DRC Mode: %s",(mStoreMetaDataInOutputBuffers ? "Dynamic Buffer Mode" :
@@ -3381,11 +3404,11 @@ void ACodec::BaseState::onInputBufferFilled(const sp<AMessage> &msg) {
                 mCodec->mInputEOSResult = err;
             }
             break;
-
-            default:
-                CHECK_EQ((int)mode, (int)FREE_BUFFERS);
-                break;
         }
+
+        default:
+            CHECK_EQ((int)mode, (int)FREE_BUFFERS);
+            break;
     }
 }
 
@@ -3727,7 +3750,11 @@ bool ACodec::UninitializedState::onAllocateComponent(const sp<AMessage> &msg) {
         // about any notifications in the afterlife.
         mDeathNotifier.clear();
     }
-
+    int32_t hardwarecodecOnly = 0;
+    if (msg->findInt32("hardwarecodecOnly", &hardwarecodecOnly)
+            && hardwarecodecOnly == 1) {
+        ALOGV("use hardware codec only");
+    }
     Vector<OMXCodec::CodecNameAndQuirks> matchingCodecs;
 
     AString mime;
@@ -3750,11 +3777,19 @@ bool ACodec::UninitializedState::onAllocateComponent(const sp<AMessage> &msg) {
             encoder = false;
         }
 
+#ifdef QCOM_HARDWARE
+        int channelCount = 0;
+        msg->findInt32("channel-count", &channelCount);
+        if (ExtendedCodec::useHWAACDecoder(mime.c_str(), channelCount) && !encoder) {
+            OMXCodec::findMatchingCodecs(mime.c_str(), encoder,
+                "OMX.qcom.audio.decoder.multiaac", 0, &matchingCodecs);
+        } else
+#endif
         OMXCodec::findMatchingCodecs(
                 mime.c_str(),
                 encoder, // createEncoder
                 NULL,  // matchComponentName
-                0,     // flags
+                hardwarecodecOnly ? OMXCodec::kHardwareCodecsOnly : 0,     // flags
                 &matchingCodecs);
     }
 
@@ -3866,6 +3901,7 @@ void ACodec::LoadedState::stateEntered() {
     mCodec->mDequeueCounter = 0;
     mCodec->mMetaDataBuffersToSubmit = 0;
     mCodec->mRepeatFrameDelayUs = -1ll;
+    mCodec->mIsConfiguredForAdaptivePlayback = false;
 
     if (mCodec->mShutdownInProgress) {
         bool keepComponentAllocated = mCodec->mKeepComponentAllocated;
@@ -3972,7 +4008,8 @@ bool ACodec::LoadedState::onConfigureComponent(
 
     sp<RefBase> obj;
     if (msg->findObject("native-window", &obj)
-            && strncmp("OMX.google.", mCodec->mComponentName.c_str(), 11)) {
+            && strncmp("OMX.google.", mCodec->mComponentName.c_str(), 11)
+            && strncmp("OMX.ffmpeg.", mCodec->mComponentName.c_str(), 11)) {
         sp<NativeWindowWrapper> nativeWindow(
                 static_cast<NativeWindowWrapper *>(obj.get()));
         CHECK(nativeWindow != NULL);
@@ -4032,6 +4069,21 @@ void ACodec::LoadedState::onCreateInputSurface(
         if (err != OK) {
             ALOGE("[%s] Unable to configure option to repeat previous "
                   "frames (err %d)",
+                  mCodec->mComponentName.c_str(),
+                  err);
+        }
+    }
+
+    if (err == OK && mCodec->mMaxPtsGapUs > 0l) {
+        err = mCodec->mOMX->setInternalOption(
+                mCodec->mNode,
+                kPortIndexInput,
+                IOMX::INTERNAL_OPTION_MAX_TIMESTAMP_GAP,
+                &mCodec->mMaxPtsGapUs,
+                sizeof(mCodec->mMaxPtsGapUs));
+
+        if (err != OK) {
+            ALOGE("[%s] Unable to configure max timestamp gap (err %d)",
                   mCodec->mComponentName.c_str(),
                   err);
         }

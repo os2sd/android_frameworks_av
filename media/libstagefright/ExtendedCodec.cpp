@@ -43,16 +43,29 @@
 #include <media/stagefright/ExtendedCodec.h>
 #include <media/stagefright/OMXCodec.h>
 
-#if defined(ENABLE_AV_ENHANCEMENTS) || defined(QCOM_LEGACY_MMPARSER)
+#include <OMX_Component.h>
 
+#if defined(ENABLE_AV_ENHANCEMENTS) || defined(QCOM_LEGACY_MMPARSER)
 #include <QCMetaData.h>
 #include <QCMediaDefs.h>
 #include <OMX_QCOMExtns.h>
-#include <OMX_Component.h>
 #include <QOMX_AudioExtensions.h>
 #include "include/ExtendedUtils.h"
+#endif
+
 
 namespace android {
+
+template<class T>
+static void InitOMXParams(T *params) {
+    params->nSize = sizeof(T);
+    params->nVersion.s.nVersionMajor = 1;
+    params->nVersion.s.nVersionMinor = 0;
+    params->nVersion.s.nRevision = 0;
+    params->nVersion.s.nStep = 0;
+}
+
+#ifdef ENABLE_AV_ENHANCEMENTS
 enum MetaKeyType{
     INT32, INT64, STRING, DATA, CSD
 };
@@ -226,15 +239,6 @@ void ExtendedCodec::overrideComponentName(
     }
 }
 
-template<class T>
-static void InitOMXParams(T *params) {
-    params->nSize = sizeof(T);
-    params->nVersion.s.nVersionMajor = 1;
-    params->nVersion.s.nVersionMinor = 0;
-    params->nVersion.s.nRevision = 0;
-    params->nVersion.s.nStep = 0;
-}
-
 status_t ExtendedCodec::setDIVXFormat(
         const sp<AMessage> &msg, const char* mime, sp<IOMX> OMXhandle,
         IOMX::node_id nodeID, int port_index) {
@@ -345,6 +349,11 @@ status_t ExtendedCodec::setAudioFormat(
         setQCELPFormat(numChannels, sampleRate, OMXhandle, nodeID, isEncoder);
     } else if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_WMA, mime))  {
         err = setWMAFormat(msg, OMXhandle, nodeID, isEncoder);
+    } else if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_AMR_WB_PLUS, mime)) {
+        int32_t numChannels, sampleRate;
+        CHECK(msg->findInt32("channel-count", &numChannels));
+        CHECK(msg->findInt32("sample-rate", &sampleRate));
+        err = setAMRWBPLUSFormat(numChannels, sampleRate, OMXhandle, nodeID);
     }
     return err;
 }
@@ -413,13 +422,16 @@ status_t ExtendedCodec::setSupportedRole(
           "video_decoder.divx", NULL },
         { MEDIA_MIMETYPE_VIDEO_WMV,
           "video_decoder.vc1",  NULL },
+#if 0 // handled by FFMPEG
         { MEDIA_MIMETYPE_AUDIO_AC3,
           "audio_decoder.ac3", NULL },
+#endif
         { MEDIA_MIMETYPE_AUDIO_WMA,
           "audio_decoder.wma" , NULL },
         { MEDIA_MIMETYPE_VIDEO_HEVC,
           "video_decoder.hevc" , NULL },
-
+        { MEDIA_MIMETYPE_VIDEO_MPEG2,
+          "video_decoder.mpeg2" , NULL },
         };
 
     static const size_t kNumMimeToRole =
@@ -468,14 +480,14 @@ status_t ExtendedCodec::getSupportedAudioFormatInfo(
         int portIndex,
         int* channelCount) {
     status_t retVal = OK;
-    if (!strcmp(mime->c_str(),MEDIA_MIMETYPE_AUDIO_QCELP)) {
+    if (!strncmp(mime->c_str(), MEDIA_MIMETYPE_AUDIO_QCELP, strlen(MEDIA_MIMETYPE_AUDIO_QCELP))) {
         OMX_AUDIO_PARAM_QCELP13TYPE params;
         InitOMXParams(&params);
         params.nPortIndex = portIndex;
         CHECK_EQ(OMXhandle->getParameter(
                    nodeID, OMX_IndexParamAudioQcelp13, &params, sizeof(params)), (status_t)OK);
         *channelCount = params.nChannels;
-    } else if(!strcmp(mime->c_str(), MEDIA_MIMETYPE_AUDIO_EVRC)) {
+    } else if(!strncmp(mime->c_str(), MEDIA_MIMETYPE_AUDIO_EVRC, strlen(MEDIA_MIMETYPE_AUDIO_EVRC))) {
         OMX_AUDIO_PARAM_EVRCTYPE params;
         InitOMXParams(&params);
         params.nPortIndex = portIndex;
@@ -608,13 +620,18 @@ void ExtendedCodec::configureVideoDecoder(
 
 bool ExtendedCodec::checkDPFromCodecSpecificData(const uint8_t *data, size_t size) {
     bool retVal = false;
+
+    if (ExtendedUtils::ShellProp::isMpeg4DPSupportedByHardware()) {
+        return retVal;
+    }
+
     size_t offset = 0, startCodeOffset = 0;
     bool isStartCode = false;
     int VOL_START_CODE = 0x20;
     const char startCode[]="\x00\x00\x01";
     size_t maxHeaderSize = 28;
 
-    if (!data && (((size < 4) || (size > maxHeaderSize)))) {
+    if (!data || (((size < 4) || (size > maxHeaderSize)))) {
         return retVal;
     }
 
@@ -642,7 +659,7 @@ bool ExtendedCodec::checkDPFromVOLHeader(const uint8_t *data, size_t size) {
     size_t minHeaderSize = 5;
     size_t maxHeaderSize = 46;
 
-    if (!data && (size < minHeaderSize)) {
+    if (!data || (size < minHeaderSize)) {
         return false;
     }
 
@@ -818,6 +835,14 @@ void ExtendedCodec::enableSmoothStreaming(
     if (strncmp(componentName, "OMX.qcom.", 9)) {
         return;
     }
+    if(strstr(componentName, ".secure")) {
+        char prop[PROPERTY_VALUE_MAX] = {0};
+        property_get("mm.disable.sec_smoothstreaming", prop, "0");
+        if (!strncmp(prop, "true", 4) || atoi(prop)) {
+            ALOGI("Smoothstreaming not enabled for secure Sessions");
+            return;
+        }
+    }
     status_t err = omx->setParameter(
             nodeID,
             (OMX_INDEXTYPE)OMX_QcomIndexParamEnableSmoothStreaming,
@@ -988,7 +1013,10 @@ status_t ExtendedCodec::setWMAFormat(
         CHECK(msg->findInt32("channel-count", &numChannels));
         CHECK(msg->findInt32("sample-rate", &sampleRate));
         CHECK(msg->findInt32(getMsgKey(kKeyBitRate), &bitRate));
-        CHECK(msg->findInt32(getMsgKey(kKeyWMAEncodeOpt), &encodeOptions));
+        if (!msg->findInt32(getMsgKey(kKeyWMAEncodeOpt), &encodeOptions)) {
+            ALOGE("Unsupported encode options");
+            return ERROR_UNSUPPORTED;
+        }
         CHECK(msg->findInt32(getMsgKey(kKeyWMABlockAlign), &blockAlign));
         ALOGV("Channels: %d, SampleRate: %d, BitRate; %d"
                    "EncodeOptions: %d, blockAlign: %d", numChannels,
@@ -1128,16 +1156,94 @@ void ExtendedCodec::setAC3Format(
     CHECK_EQ(err, (status_t)OK);
 }
 
-bool ExtendedCodec::useHWAACDecoder(const char *mime) {
+status_t ExtendedCodec::setAMRWBPLUSFormat(
+        int32_t numChannels, int32_t sampleRate, sp<IOMX> OMXhandle,
+        IOMX::node_id nodeID) {
+
+    QOMX_AUDIO_PARAM_AMRWBPLUSTYPE profileAMRWBPlus;
+    OMX_INDEXTYPE indexTypeAMRWBPlus;
+    OMX_PARAM_PORTDEFINITIONTYPE portParam;
+
+    ALOGV("AMRWB+ setformat sampleRate:%d numChannels:%d",sampleRate,numChannels);
+
+    //configure input port
+    InitOMXParams(&portParam);
+    portParam.nPortIndex = kPortIndexInput;
+    status_t err = OMXhandle->getParameter(
+       nodeID, OMX_IndexParamPortDefinition, &portParam, sizeof(portParam));
+    CHECK_EQ(err, (status_t)OK);
+    err = OMXhandle->setParameter(
+       nodeID, OMX_IndexParamPortDefinition, &portParam, sizeof(portParam));
+    CHECK_EQ(err, (status_t)OK);
+
+    //configure output port
+    portParam.nPortIndex = kPortIndexOutput;
+    err = OMXhandle->getParameter(
+       nodeID, OMX_IndexParamPortDefinition, &portParam, sizeof(portParam));
+    CHECK_EQ(err, (status_t)OK);
+    err = OMXhandle->setParameter(
+       nodeID, OMX_IndexParamPortDefinition, &portParam, sizeof(portParam));
+    CHECK_EQ(err, (status_t)OK);
+
+    err = OMXhandle->getExtensionIndex(nodeID, OMX_QCOM_INDEX_PARAM_AMRWBPLUS, &indexTypeAMRWBPlus);
+
+    //for input port
+    InitOMXParams(&profileAMRWBPlus);
+    profileAMRWBPlus.nPortIndex = kPortIndexInput;
+    err = OMXhandle->getParameter(nodeID, indexTypeAMRWBPlus, &profileAMRWBPlus, sizeof(profileAMRWBPlus));
+    CHECK_EQ(err,(status_t)OK);
+
+    profileAMRWBPlus.nSampleRate = sampleRate;
+    profileAMRWBPlus.nChannels = numChannels;
+    err = OMXhandle->setParameter(nodeID, indexTypeAMRWBPlus, &profileAMRWBPlus, sizeof(profileAMRWBPlus));
+    CHECK_EQ(err,(status_t)OK);
+
+    //for output port
+    OMX_AUDIO_PARAM_PCMMODETYPE profilePcm;
+    InitOMXParams(&profilePcm);
+    profilePcm.nPortIndex = kPortIndexOutput;
+    err = OMXhandle->getParameter(
+            nodeID, OMX_IndexParamAudioPcm, &profilePcm, sizeof(profilePcm));
+    CHECK_EQ(err, (status_t)OK);
+
+    profilePcm.nSamplingRate = sampleRate;
+    profilePcm.nChannels = numChannels;
+    err = OMXhandle->setParameter(
+            nodeID, OMX_IndexParamAudioPcm, &profilePcm, sizeof(profilePcm));
+    CHECK_EQ(err, (status_t)OK);
+
+    return err;
+}
+
+bool ExtendedCodec::useHWAACDecoder(const char *mime, int channelCount) {
     char value[PROPERTY_VALUE_MAX] = {0};
     int aaccodectype = 0;
     aaccodectype = property_get("media.aaccodectype", value, NULL);
-    if (aaccodectype && !strncmp("0", value, 1) &&
-        !strncmp(mime, MEDIA_MIMETYPE_AUDIO_AAC,sizeof(MEDIA_MIMETYPE_AUDIO_AAC))) {
+    if (aaccodectype && !strncmp("1", value, 1) &&
+        channelCount > 2 &&
+        !strncmp(mime, MEDIA_MIMETYPE_AUDIO_AAC, strlen(MEDIA_MIMETYPE_AUDIO_AAC))) {
         ALOGI("Using Hardware AAC Decoder");
         return true;
     }
     return false;
+}
+
+ExtendedCodec::kHEVCCodecType ExtendedCodec::useHEVCDecoder(const char *mime) {
+    char value[PROPERTY_VALUE_MAX] = {0};
+    int sw_codectype = 0, hw_codectype = 0;
+    if (!strcmp(mime, MEDIA_MIMETYPE_VIDEO_HEVC)) {
+        sw_codectype = property_get("media.swhevccodectype", value, NULL);
+        if (sw_codectype && !strncmp("1", value, 1)) {
+            ALOGI("Using SW HEVC Decoder");
+            return ExtendedCodec::kCodecType_SWHEVC;
+        }
+        hw_codectype = property_get("media.hwhevccodectype", value, NULL);
+        if (hw_codectype && !strncmp("1", value, 1)) {
+            ALOGI("Using HW HEVC Decoder");
+            return ExtendedCodec::kCodecType_HWHEVC;
+        }
+    }
+    return ExtendedCodec::kCodecType_None;
 }
 
 bool ExtendedCodec::isSourcePauseRequired(const char *componentName) {
@@ -1148,11 +1254,8 @@ bool ExtendedCodec::isSourcePauseRequired(const char *componentName) {
     return false;
 }
 
-} //namespace android
-
 #else //ENABLE_AV_ENHANCEMENTS
 
-namespace android {
     status_t ExtendedCodec::convertMetaDataToMessage(
             const sp<MetaData> &meta, sp<AMessage> *format) {
         return OK;
@@ -1277,6 +1380,12 @@ namespace android {
             sp<IOMX> OMXhandle, IOMX::node_id nodeID) {
     }
 
+    status_t ExtendedCodec::setAMRWBPLUSFormat(
+            int32_t numChannels, int32_t sampleRate,
+            sp<IOMX> OMXhandle, IOMX::node_id nodeID) {
+        return OK;
+    }
+
     void ExtendedCodec::configureFramePackingFormat(
             const sp<AMessage> &msg, sp<IOMX> OMXhandle,
             IOMX::node_id nodeID, const char* componentName){
@@ -1297,10 +1406,13 @@ namespace android {
         const uint32_t flags, IOMX::node_id nodeID, const char* componentName) {
     }
 
-    bool ExtendedCodec::useHWAACDecoder(const char *mime) {
+    bool ExtendedCodec::useHWAACDecoder(const char *mime, int channelCount) {
         return false;
     }
 
+    ExtendedCodec::kHEVCCodecType ExtendedCodec::useHEVCDecoder(const char *mime) {
+        return ExtendedCodec::kCodecType_None;
+    }
     void ExtendedCodec::enableSmoothStreaming(
             const sp<IOMX> &omx, IOMX::node_id nodeID, bool* isEnabled,
             const char* componentName) {
@@ -1311,6 +1423,41 @@ namespace android {
     bool ExtendedCodec::isSourcePauseRequired(const char *componentName) {
         return false;
     }
-} //namespace android
 
 #endif //ENABLE_AV_ENHANCEMENTS
+
+} //namespace android
+
+#if defined(ENABLE_AV_ENHANCEMENTS) || defined(ENABLE_OFFLOAD_ENHANCEMENTS)
+namespace android {
+
+    status_t ExtendedCodec::updatePcmOutputFormat(
+            const sp<MetaData> &meta, sp<IOMX> OMXhandle, IOMX::node_id nodeID,
+            const char* componentName) {
+
+        OMX_AUDIO_PARAM_PCMMODETYPE param;
+        int32_t bits_per_sample = 16;
+        int32_t sample_rate;
+        int32_t channels;
+        status_t err = OK;
+
+        CHECK(meta->findInt32(kKeyChannelCount, &channels));
+        CHECK(meta->findInt32(kKeySampleRate, &sample_rate));
+
+        if (!meta->findInt32(kKeySampleBits, &bits_per_sample)) {
+            ALOGD("Bits per sample not specified, using default 16");
+        }
+        ALOGD("Update output bit width = %d", bits_per_sample);
+
+        InitOMXParams(&param);
+        param.nPortIndex = kPortIndexOutput; 
+        param.nChannels = channels;
+        param.nSamplingRate = sample_rate;
+        param.nBitPerSample = bits_per_sample;
+
+        return OMXhandle->setParameter(nodeID, OMX_IndexParamAudioPcm,
+                &param, sizeof(param));
+    }
+
+} // namespace android
+#endif

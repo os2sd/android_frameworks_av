@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <camera/CameraParameters.h>
+#include <camera/CameraParametersExtra.h>
 
 namespace android {
 // Parameter keys to communicate between camera application and driver.
@@ -162,6 +163,19 @@ const char CameraParameters::KEY_METERING[] = "metering";
 const char CameraParameters::KEY_WDR[] = "wdr";
 const char CameraParameters::KEY_WEATHER[] = "weather";
 const char CameraParameters::KEY_CITYID[] = "contextualtag-cityid";
+
+const char CameraParameters::KEY_DYNAMIC_RANGE_CONTROL[] = "dynamic-range-control";
+const char CameraParameters::KEY_SUPPORTED_DYNAMIC_RANGE_CONTROL[] = "dynamic-range-control-values";
+const char CameraParameters::KEY_PHASE_AF[] = "phase-af";
+const char CameraParameters::KEY_SUPPORTED_PHASE_AF[] = "phase-af-values";
+const char CameraParameters::KEY_RT_HDR[] = "rt-hdr";
+const char CameraParameters::KEY_SUPPORTED_RT_HDR[] = "rt-hdr-values";
+const char CameraParameters::DRC_ON[] = "on";
+const char CameraParameters::DRC_OFF[] = "off";
+const char CameraParameters::PAF_ON[] = "on";
+const char CameraParameters::PAF_OFF[] = "off";
+const char CameraParameters::RTHDR_ON[] = "on";
+const char CameraParameters::RTHDR_OFF[] = "off";
 #endif
 
 #ifdef HTC_CAMERA_HARDWARE
@@ -270,7 +284,7 @@ const char CameraParameters::WHITE_BALANCE_DAYLIGHT[] = "daylight";
 const char CameraParameters::WHITE_BALANCE_CLOUDY_DAYLIGHT[] = "cloudy-daylight";
 const char CameraParameters::WHITE_BALANCE_TWILIGHT[] = "twilight";
 const char CameraParameters::WHITE_BALANCE_SHADE[] = "shade";
-#ifdef OPPO_CAMERA_HARDWARE
+#ifdef QCOM_HARDWARE
 const char CameraParameters::WHITE_BALANCE_MANUAL_CCT[] = "manual-cct";
 #endif
 
@@ -381,7 +395,7 @@ const char CameraParameters::FOCUS_MODE_FIXED[] = "fixed";
 const char CameraParameters::FOCUS_MODE_EDOF[] = "edof";
 const char CameraParameters::FOCUS_MODE_CONTINUOUS_VIDEO[] = "continuous-video";
 const char CameraParameters::FOCUS_MODE_CONTINUOUS_PICTURE[] = "continuous-picture";
-#ifdef OPPO_CAMERA_HARDWARE
+#ifdef QCOM_HARDWARE
 const char CameraParameters::FOCUS_MODE_MANUAL_POSITION[] = "manual";
 #endif
 #if defined(QCOM_HARDWARE) || defined(BCM_HARDWARE)
@@ -533,6 +547,10 @@ int CameraParameters::getMode() const
 const char CameraParameters::LIGHTFX_LOWLIGHT[] = "low-light";
 const char CameraParameters::LIGHTFX_HDR[] = "high-dynamic-range";
 
+#ifdef CAMERA_PARAMETERS_EXTRA_C
+CAMERA_PARAMETERS_EXTRA_C
+#endif
+
 CameraParameters::CameraParameters()
                 : mMap()
 {
@@ -610,6 +628,14 @@ void CameraParameters::set(const char *key, const char *value)
         //XXX ALOGE("Value \"%s\"contains invalid character (= or ;)", value);
         return;
     }
+#ifdef QCOM_HARDWARE
+    // qcom cameras default to delivering an extra zero-exposure frame on HDR.
+    // The android SDK only wants one frame, so disable this unless the app
+    // explicitly asks for it
+    if (!get("hdr-need-1x")) {
+        mMap.replaceValueFor(String8("hdr-need-1x"), String8("false"));
+    }
+#endif
 
     mMap.replaceValueFor(String8(key), String8(value));
 }

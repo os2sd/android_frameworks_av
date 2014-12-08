@@ -33,6 +33,7 @@ LOCAL_SRC_FILES:=                         \
         AwesomePlayer.cpp                 \
         CameraSource.cpp                  \
         CameraSourceTimeLapse.cpp         \
+        ClockEstimator.cpp                \
         DataSource.cpp                    \
         DRMExtractor.cpp                  \
         ESDS.cpp                          \
@@ -77,6 +78,7 @@ LOCAL_SRC_FILES:=                         \
         avc_utils.cpp                     \
         mp4/FragmentedMP4Parser.cpp       \
         mp4/TrackFragment.cpp             \
+        APE.cpp                           \
 
 LOCAL_C_INCLUDES:= \
         $(TOP)/frameworks/av/include/media/stagefright/timedtext \
@@ -97,38 +99,30 @@ ifneq ($(filter caf bfam,$(TARGET_QCOM_AUDIO_VARIANT)),)
     ifeq ($(BOARD_USES_LEGACY_ALSA_AUDIO),true)
         ifeq ($(call is-chipset-in-board-platform,msm8960),true)
             LOCAL_SRC_FILES += LPAPlayerALSA.cpp TunnelPlayer.cpp
-            LOCAL_CFLAGS += -DUSE_TUNNEL_MODE -DUSE_LPA_MODE
+            LOCAL_CFLAGS += -DUSE_TUNNEL_MODE
             LOCAL_CFLAGS += -DTUNNEL_MODE_SUPPORTS_AMRWB
         endif
         ifeq ($(call is-chipset-in-board-platform,msm8974),true)
             # If you are using legacy mode on 8974, you will not
             # go to space today. Also, it probably is broken.
             LOCAL_SRC_FILES += LPAPlayerALSA.cpp TunnelPlayer.cpp
-            LOCAL_CFLAGS += -DUSE_TUNNEL_MODE -DUSE_LPA_MODE
+            LOCAL_CFLAGS += -DUSE_TUNNEL_MODE
         endif
-        ifeq ($(call is-chipset-in-board-platform,msm8660),true)
+        ifneq ($(filter msm8660 msm7x30 msm7x27a,$(TARGET_BOARD_PLATFORM)),)
             LOCAL_SRC_FILES += LPAPlayer.cpp
-            LOCAL_CFLAGS += -DLEGACY_LPA -DUSE_LPA_MODE
-        endif
-        ifeq ($(call is-chipset-in-board-platform,msm7x30),true)
-            LOCAL_SRC_FILES += LPAPlayer.cpp
-            LOCAL_CFLAGS += -DLEGACY_LPA -DUSE_LPA_MODE
+            LOCAL_CFLAGS += -DLEGACY_LPA
         endif
         ifeq ($(NO_TUNNEL_MODE_FOR_MULTICHANNEL),true)
             LOCAL_CFLAGS += -DNO_TUNNEL_MODE_FOR_MULTICHANNEL
         endif
+        LOCAL_SHARED_LIBRARIES += libstagefright_mp3dec
     endif
 endif
 
-ifneq ($(TARGET_QCOM_MEDIA_VARIANT),)
 LOCAL_C_INCLUDES += \
-        $(TOP)/hardware/qcom/media-$(TARGET_QCOM_MEDIA_VARIANT)/mm-core/inc
+    $(call project-path-for,qcom-media)/mm-core/inc
 ifneq ($(TARGET_QCOM_MEDIA_VARIANT),caf-new)
     LOCAL_CFLAGS += -DLEGACY_MEDIA
-endif
-else
-LOCAL_C_INCLUDES += \
-        $(TOP)/hardware/qcom/media/mm-core/inc
 endif
 
 LOCAL_SHARED_LIBRARIES := \
@@ -155,9 +149,17 @@ LOCAL_SHARED_LIBRARIES := \
         libz \
         libpowermanager
 
+#QTI FLAC Decoder
+ifeq ($(call is-vendor-board-platform,QCOM),true)
+ifeq ($(strip $(AUDIO_FEATURE_ENABLED_EXTN_FLAC_DECODER)),true)
+LOCAL_SRC_FILES += FLACDecoder.cpp
+LOCAL_C_INCLUDES += $(TARGET_OUT_HEADERS)/mm-audio/audio-flac
+LOCAL_CFLAGS := -DQTI_FLAC_DECODER
+endif
+endif
+
 LOCAL_STATIC_LIBRARIES := \
         libstagefright_color_conversion \
-        libstagefright_mp3dec \
         libstagefright_aacenc \
         libstagefright_matroska \
         libstagefright_timedtext \
@@ -173,18 +175,18 @@ LOCAL_SRC_FILES += ExtendedCodec.cpp ExtendedExtractor.cpp ExtendedUtils.cpp
 
 ifeq ($(TARGET_ENABLE_QC_AV_ENHANCEMENTS),true)
     LOCAL_CFLAGS     += -DENABLE_AV_ENHANCEMENTS
-    LOCAL_SRC_FILES  += ExtendedMediaDefs.cpp ExtendedWriter.cpp
+    LOCAL_SRC_FILES  += ExtendedMediaDefs.cpp ExtendedPrefetchSource.cpp ExtendedWriter.cpp
     LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
     LOCAL_ADDITIONAL_DEPENDENCIES := $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
 
-    ifneq ($(TARGET_QCOM_MEDIA_VARIANT),)
-        LOCAL_C_INCLUDES += \
-            $(TOP)/hardware/qcom/media-$(TARGET_QCOM_MEDIA_VARIANT)/mm-core/inc
-    else
-        LOCAL_C_INCLUDES += \
-            $(TOP)/hardware/qcom/media/mm-core/inc
-    endif
-endif #TARGET_ENABLE_AV_ENHANCEMENTS
+    LOCAL_C_INCLUDES += \
+        $(call project-path-for,qcom-media)/mm-core/inc
+
+else #TARGET_ENABLE_AV_ENHANCEMENTS
+ifeq ($(TARGET_ENABLE_OFFLOAD_ENHANCEMENTS),true)
+    LOCAL_CFLAGS += -DENABLE_OFFLOAD_ENHANCEMENTS
+endif
+endif
 
 ifeq ($(TARGET_QCOM_LEGACY_OMX),true)
         LOCAL_CFLAGS     += -DQCOM_LEGACY_OMX

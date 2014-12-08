@@ -203,17 +203,21 @@ status_t AudioRecord::set(
         ALOGE("Invalid format %d", format);
         return BAD_VALUE;
     }
-#ifdef QCOM_HARDWARE
+#if defined(QCOM_HARDWARE) && !defined(QCOM_DIRECTTRACK)
     if (format != AUDIO_FORMAT_PCM_16_BIT &&
            !audio_is_compress_voip_format(format) &&
            !audio_is_compress_capture_format(format)) {
 #else
+#ifndef QCOM_DIRECTTRACK
     // Temporary restriction: AudioFlinger currently supports 16-bit PCM only
     if (format != AUDIO_FORMAT_PCM_16_BIT) {
 #endif
+#endif
+#ifndef QCOM_DIRECTTRACK
         ALOGE("Format %d is not supported", format);
         return BAD_VALUE;
     }
+#endif
 
     mFormat = format;
 
@@ -222,12 +226,7 @@ status_t AudioRecord::set(
         return BAD_VALUE;
     }
     mChannelMask = channelMask;
-    uint32_t channelCount = popcount(channelMask
-#ifdef QCOM_HARDWARE
-        &(AUDIO_CHANNEL_IN_STEREO|AUDIO_CHANNEL_IN_MONO|AUDIO_CHANNEL_IN_5POINT1));
-#else
-    );
-#endif
+    uint32_t channelCount = popcount(channelMask);
     mChannelCount = channelCount;
 
 #ifdef QCOM_DIRECTTRACK
@@ -610,13 +609,13 @@ status_t AudioRecord::obtainBuffer(Buffer* audioBuffer, int32_t waitCount)
     }
 
     const struct timespec *requested;
+    struct timespec timeout;
     if (waitCount == -1) {
         requested = &ClientProxy::kForever;
     } else if (waitCount == 0) {
         requested = &ClientProxy::kNonBlocking;
     } else if (waitCount > 0) {
         long long ms = WAIT_PERIOD_MS * (long long) waitCount;
-        struct timespec timeout;
         timeout.tv_sec = ms / 1000;
         timeout.tv_nsec = (int) (ms % 1000) * 1000000;
         requested = &timeout;

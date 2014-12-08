@@ -1,4 +1,7 @@
 /*
+ * Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+ * Not a Contribution.
+ *
  * Copyright (C) 2009 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -317,6 +320,8 @@ private:
     status_t setDTSFormat(const sp<MetaData> &inputFormat);
     status_t setFFmpegAudioFormat(const sp<MetaData> &inputFormat);
 
+    status_t getPCMOutputFormat(const sp<MetaData> &meta);
+
     status_t allocateBuffers();
     status_t allocateBuffersOnPort(OMX_U32 portIndex);
 #ifdef USE_SAMSUNG_COLORFORMAT
@@ -391,6 +396,8 @@ private:
             unsigned *profile, unsigned *level);
 
     status_t stopOmxComponent_l();
+    status_t flushBuffersOnError();
+    status_t releaseMediaBuffersOn(OMX_U32 portIndex);
 
     OMXCodec(const OMXCodec &);
     OMXCodec &operator=(const OMXCodec &);

@@ -425,8 +425,8 @@ status_t CameraService::connect(
 
     sp<Client> client;
     {
-        Mutex::Autolock lock(mServiceLock);
         sp<BasicClient> clientTmp;
+        Mutex::Autolock lock(mServiceLock);
         if (!canConnectUnsafe(cameraId, clientPackageName,
                               cameraClient->asBinder(),
                               /*out*/clientTmp)) {
@@ -542,8 +542,8 @@ status_t CameraService::connectPro(
           case CAMERA_DEVICE_API_VERSION_2_0:
           case CAMERA_DEVICE_API_VERSION_2_1:
           case CAMERA_DEVICE_API_VERSION_3_0:
-            client = new ProCamera2Client(this, cameraCb, String16(),
-                    cameraId, facing, callingPid, USE_CALLING_UID, getpid());
+            client = new ProCamera2Client(this, cameraCb, clientPackageName,
+                    cameraId, facing, callingPid, clientUid, getpid());
             break;
           case -1:
             ALOGE("Invalid camera id %d", cameraId);
@@ -620,8 +620,8 @@ status_t CameraService::connectDevice(
           case CAMERA_DEVICE_API_VERSION_2_0:
           case CAMERA_DEVICE_API_VERSION_2_1:
           case CAMERA_DEVICE_API_VERSION_3_0:
-            client = new CameraDeviceClient(this, cameraCb, String16(),
-                    cameraId, facing, callingPid, USE_CALLING_UID, getpid());
+            client = new CameraDeviceClient(this, cameraCb, clientPackageName,
+                    cameraId, facing, callingPid, clientUid, getpid());
             break;
           case -1:
             ALOGE("Invalid camera id %d", cameraId);
@@ -656,6 +656,11 @@ status_t CameraService::addListener(
                                 const sp<ICameraServiceListener>& listener) {
     ALOGV("%s: Add listener %p", __FUNCTION__, listener.get());
 
+    if (listener == 0) {
+        ALOGE("%s: Listener must not be null", __FUNCTION__);
+        return BAD_VALUE;
+    }
+
     Mutex::Autolock lock(mServiceLock);
 
     Vector<sp<ICameraServiceListener> >::iterator it, end;
@@ -683,6 +688,11 @@ status_t CameraService::addListener(
 status_t CameraService::removeListener(
                                 const sp<ICameraServiceListener>& listener) {
     ALOGV("%s: Remove listener %p", __FUNCTION__, listener.get());
+
+    if (listener == 0) {
+        ALOGE("%s: Listener must not be null", __FUNCTION__);
+        return BAD_VALUE;
+    }
 
     Mutex::Autolock lock(mServiceLock);
 
@@ -825,6 +835,7 @@ status_t CameraService::onTransact(
     switch (code) {
         case BnCameraService::CONNECT:
         case BnCameraService::CONNECT_PRO:
+        case BnCameraService::CONNECT_DEVICE:
             const int pid = getCallingPid();
             const int self_pid = getpid();
             if (pid != self_pid) {
