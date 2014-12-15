@@ -156,6 +156,10 @@ ifeq ($(TARGET_USES_QCOM_BSP), true)
 endif
 
 ifeq ($(TARGET_ENABLE_QC_AV_ENHANCEMENTS),true)
+       ifeq ($(TARGET_QCOM_LEGACY_OMX),true)
+           LOCAL_CFLAGS += -DQCOM_LEGACY_OMX
+           LOCAL_CFLAGS += -DQCOM_LEGACY_MMPARSER
+       endif
        LOCAL_CFLAGS     += -DENABLE_AV_ENHANCEMENTS
        LOCAL_C_INCLUDES += $(TOP)/$(call project-path-for,qcom-media)/mm-core/inc
        LOCAL_C_INCLUDES += $(TOP)/frameworks/av/media/libstagefright/include
