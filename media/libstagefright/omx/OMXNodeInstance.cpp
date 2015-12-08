@@ -97,12 +97,13 @@ OMX_CALLBACKTYPE OMXNodeInstance::kCallbacks = {
 };
 
 OMXNodeInstance::OMXNodeInstance(
-        OMX *owner, const sp<IOMXObserver> &observer)
+        OMX *owner, const sp<IOMXObserver> &observer, const char *name)
     : mOwner(owner),
       mNodeID(NULL),
       mHandle(NULL),
       mObserver(observer),
       mDying(false) {
+    mIsSecure = AString(name).endsWith(".secure");
 #ifdef MTK_HARDWARE
     mMtkBufferHandler = new OMXNodeInstanceBufferHandler(this);
 #endif
@@ -850,6 +851,12 @@ status_t OMXNodeInstance::emptyBuffer(
     Mutex::Autolock autoLock(mLock);
 
     OMX_BUFFERHEADERTYPE *header = (OMX_BUFFERHEADERTYPE *)buffer;
+    // rangeLength and rangeOffset must be a subset of the allocated data in the buffer.
+    // corner case: we permit rangeOffset == end-of-buffer with rangeLength == 0.
+    if (rangeOffset > header->nAllocLen
+            || rangeLength > header->nAllocLen - rangeOffset) {
+        return BAD_VALUE;
+    }
     header->nFilledLen = rangeLength;
     header->nOffset = rangeOffset;
     header->nFlags = flags;
