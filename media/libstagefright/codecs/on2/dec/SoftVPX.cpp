@@ -134,7 +134,7 @@ void SoftVPX::onQueueFilled(OMX_U32 portIndex) {
         vpx_image_t *img = vpx_codec_get_frame((vpx_codec_ctx_t *)mCtx, &iter);
 
         if (img != NULL) {
-            CHECK_EQ(img->fmt, IMG_FMT_I420);
+            CHECK_EQ(img->fmt, VPX_IMG_FMT_I420);
 
             uint32_t width = img->d_w;
             uint32_t height = img->d_h;
@@ -155,31 +155,36 @@ void SoftVPX::onQueueFilled(OMX_U32 portIndex) {
             outHeader->nFlags = EOSseen ? OMX_BUFFERFLAG_EOS : 0;
             outHeader->nTimeStamp = inHeader->nTimeStamp;
 
-            const uint8_t *srcLine = (const uint8_t *)img->planes[PLANE_Y];
-            uint8_t *dst = outHeader->pBuffer;
-            for (size_t i = 0; i < img->d_h; ++i) {
-                memcpy(dst, srcLine, img->d_w);
+            if (outHeader->nAllocLen >= outHeader->nFilledLen) {
+                const uint8_t *srcLine = (const uint8_t *)img->planes[VPX_PLANE_Y];
+                uint8_t *dst = outHeader->pBuffer;
+                for (size_t i = 0; i < img->d_h; ++i) {
+                    memcpy(dst, srcLine, img->d_w);
 
-                srcLine += img->stride[PLANE_Y];
-                dst += img->d_w;
+                    srcLine += img->stride[VPX_PLANE_Y];
+                    dst += img->d_w;
+                }
+
+                srcLine = (const uint8_t *)img->planes[VPX_PLANE_U];
+                for (size_t i = 0; i < img->d_h / 2; ++i) {
+                    memcpy(dst, srcLine, img->d_w / 2);
+
+                    srcLine += img->stride[VPX_PLANE_U];
+                    dst += img->d_w / 2;
+                }
+
+                srcLine = (const uint8_t *)img->planes[VPX_PLANE_V];
+                for (size_t i = 0; i < img->d_h / 2; ++i) {
+                    memcpy(dst, srcLine, img->d_w / 2);
+
+                    srcLine += img->stride[VPX_PLANE_V];
+                    dst += img->d_w / 2;
+                }
+            } else {
+                ALOGE("b/27597103, buffer too small");
+                android_errorWriteLog(0x534e4554, "27597103");
+                outHeader->nFilledLen = 0;
             }
-
-            srcLine = (const uint8_t *)img->planes[PLANE_U];
-            for (size_t i = 0; i < img->d_h / 2; ++i) {
-                memcpy(dst, srcLine, img->d_w / 2);
-
-                srcLine += img->stride[PLANE_U];
-                dst += img->d_w / 2;
-            }
-
-            srcLine = (const uint8_t *)img->planes[PLANE_V];
-            for (size_t i = 0; i < img->d_h / 2; ++i) {
-                memcpy(dst, srcLine, img->d_w / 2);
-
-                srcLine += img->stride[PLANE_V];
-                dst += img->d_w / 2;
-            }
-
             outInfo->mOwnedByUs = false;
             outQueue.erase(outQueue.begin());
             outInfo = NULL;
