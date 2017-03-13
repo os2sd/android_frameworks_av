@@ -512,7 +512,8 @@ sp<MetaData> MPEG4Extractor::getTrackMetaData(
             } else {
                 uint32_t sampleIndex;
                 uint64_t sampleTime;
-                if (track->sampleTable->findThumbnailSample(&sampleIndex) == OK
+                if (track->timescale != 0 &&
+                        track->sampleTable->findThumbnailSample(&sampleIndex) == OK
                         && track->sampleTable->getMetaDataForSample(
                             sampleIndex, NULL /* offset */, NULL /* size */,
                             &sampleTime) == OK) {
@@ -903,6 +904,10 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
         case FOURCC('s', 'c', 'h', 'i'):
         case FOURCC('e', 'd', 't', 's'):
         {
+            if (chunk_type == FOURCC('m', 'o', 'o', 'v') && depth != 0) {
+                ALOGE("moov: depth %d", depth);
+                return ERROR_MALFORMED;
+            }
             if (chunk_type == FOURCC('s', 't', 'b', 'l')) {
                 ALOGV("sampleTable chunk is %d bytes long.", (size_t)chunk_size);
 
@@ -916,12 +921,18 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
                         mDataSource = cachedSource;
                     }
                 }
-
+                if (mLastTrack == NULL) {
+                    return ERROR_MALFORMED;
+                }
                 mLastTrack->sampleTable = new SampleTable(mDataSource);
             }
 
             bool isTrack = false;
             if (chunk_type == FOURCC('t', 'r', 'a', 'k')) {
+                if (depth != 1) {
+                    ALOGE("trak: depth %d", depth);
+                    return ERROR_MALFORMED;
+                }
                 isTrack = true;
 
                 Track *track = new Track;
@@ -945,6 +956,10 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
             while (*offset < stop_offset) {
                 status_t err = parseChunk(offset, depth + 1);
                 if (err != OK) {
+                    if (isTrack) {
+                        mLastTrack->skipTrack = true;
+                        break;
+                    }
                     return err;
                 }
             }
@@ -1013,6 +1028,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
             } else if (mHeaderTimescale == 0) {
                 ALOGW("ignoring edit list because timescale is 0");
             } else {
+                if (mLastTrack == NULL) {
+                    return ERROR_MALFORMED;
+                }
                 off64_t entriesoffset = data_offset + 8;
                 uint64_t segment_duration;
                 int64_t media_time;
@@ -1064,6 +1082,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('f', 'r', 'm', 'a'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             uint32_t original_fourcc;
             if (mDataSource->readAt(data_offset, &original_fourcc, 4) < 4) {
                 return ERROR_IO;
@@ -1083,6 +1104,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('t', 'e', 'n', 'c'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             if (chunk_size < 32) {
                 return ERROR_MALFORMED;
             }
@@ -1133,6 +1157,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('t', 'k', 'h', 'd'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             status_t err;
             if ((err = parseTrackHeader(data_offset, chunk_data_size)) != OK) {
                 return err;
@@ -1178,6 +1205,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('m', 'd', 'h', 'd'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             if (chunk_data_size < 4) {
                 return ERROR_MALFORMED;
             }
@@ -1264,10 +1294,6 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('s', 't', 's', 'd'):
         {
-            if (chunk_data_size < 8) {
-                return ERROR_MALFORMED;
-            }
-
             uint8_t buffer[8];
             if (chunk_data_size < (off64_t)sizeof(buffer)) {
                 return ERROR_MALFORMED;
@@ -1286,6 +1312,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
             uint32_t entry_count = U32_AT(&buffer[4]);
 
             if (entry_count > 1) {
+                if (mLastTrack == NULL) {
+                    return ERROR_MALFORMED;
+                }
                 // For 3GPP timed text, there could be multiple tx3g boxes contain
                 // multiple text display formats. These formats will be used to
                 // display the timed text.
@@ -1333,6 +1362,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
         case FOURCC('a', 'c', '-', '3'):
         case FOURCC('e', 'c', '-', '3'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             uint8_t buffer[8 + 20];
             if (chunk_data_size < (ssize_t)sizeof(buffer)) {
                 // Basic AudioSampleEntry size.
@@ -1396,6 +1428,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
         case FOURCC('h', '2', '6', '3'):
         case FOURCC('a', 'v', 'c', '1'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             mHasVideo = true;
 
             uint8_t buffer[78];
@@ -1448,6 +1483,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
         case FOURCC('s', 't', 'c', 'o'):
         case FOURCC('c', 'o', '6', '4'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             status_t err =
                 mLastTrack->sampleTable->setChunkOffsetParams(
                         chunk_type, data_offset, chunk_data_size);
@@ -1462,6 +1500,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('s', 't', 's', 'c'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             status_t err =
                 mLastTrack->sampleTable->setSampleToChunkParams(
                         data_offset, chunk_data_size);
@@ -1477,6 +1518,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
         case FOURCC('s', 't', 's', 'z'):
         case FOURCC('s', 't', 'z', '2'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             status_t err =
                 mLastTrack->sampleTable->setSampleSizeParams(
                         chunk_type, data_offset, chunk_data_size);
@@ -1557,6 +1601,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('s', 't', 't', 's'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             status_t err =
                 mLastTrack->sampleTable->setTimeToSampleParams(
                         data_offset, chunk_data_size);
@@ -1571,6 +1618,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('c', 't', 't', 's'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             status_t err =
                 mLastTrack->sampleTable->setCompositionTimeToSampleParams(
                         data_offset, chunk_data_size);
@@ -1585,6 +1635,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('s', 't', 's', 's'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             // Ignore stss block for audio even if its present
             // All audio sample are sync samples itself,
             // self decodeable and playable.
@@ -1642,6 +1695,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('e', 's', 'd', 's'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             if (chunk_data_size < 4) {
                 return ERROR_MALFORMED;
             }
@@ -1695,6 +1751,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 #endif
         case FOURCC('a', 'v', 'c', 'C'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             sp<ABuffer> buffer = new ABuffer(chunk_data_size);
 
             if (buffer->data() == NULL) {
@@ -1716,6 +1775,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('d', '2', '6', '3'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             /*
              * d263 contains a fixed 7 bytes part:
              *   vendor - 4 bytes
@@ -1801,6 +1863,10 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('m', 'v', 'h', 'd'):
         {
+            if (depth != 1) {
+                ALOGE("mvhd: depth %d", depth);
+                return ERROR_MALFORMED;
+            }
             if (chunk_data_size < 24) {
                 return ERROR_MALFORMED;
             }
@@ -1849,6 +1915,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('h', 'd', 'l', 'r'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             uint32_t buffer;
             if (mDataSource->readAt(
                         data_offset + 8, &buffer, 4) < 4) {
@@ -1869,6 +1938,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('t', 'x', '3', 'g'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             uint32_t type;
             const void *data;
             size_t size = 0;
@@ -1949,6 +2021,9 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
 
         case FOURCC('s', 'i', 'd', 'x'):
         {
+            if (mLastTrack == NULL) {
+                return ERROR_MALFORMED;
+            }
             parseSegmentIndex(data_offset, chunk_data_size);
             *offset += chunk_size;
             return UNKNOWN_ERROR; // stop parsing after sidx
@@ -2311,6 +2386,9 @@ status_t MPEG4Extractor::parseMetaData(off64_t offset, size_t size) {
                     int32_t delay, padding;
                     if (sscanf(mLastCommentData,
                                " %*x %x %x %*x", &delay, &padding) == 2) {
+                        if (mLastTrack == NULL) {
+                            return ERROR_MALFORMED;
+                        }
                         mLastTrack->meta->setInt32(kKeyEncoderDelay, delay);
                         mLastTrack->meta->setInt32(kKeyEncoderPadding, padding);
                     }
