@@ -69,6 +69,7 @@ public:
                 const sp<SampleTable> &sampleTable,
                 Vector<SidxEntry> &sidx,
                 off64_t firstMoofOffset);
+    virtual status_t init();
 
     virtual status_t start(MetaData *params = NULL);
     virtual status_t stop();
@@ -908,6 +909,12 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
                 ALOGE("moov: depth %d", depth);
                 return ERROR_MALFORMED;
             }
+
+            if (chunk_type == FOURCC('m', 'o', 'o', 'v') && mInitCheck == OK) {
+                ALOGE("duplicate moov");
+                return ERROR_MALFORMED;
+            }
+
             if (chunk_type == FOURCC('s', 't', 'b', 'l')) {
                 ALOGV("sampleTable chunk is %d bytes long.", (size_t)chunk_size);
 
@@ -974,6 +981,12 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
                 if (!mLastTrack->meta->findInt32(kKeyTrackID, &trackId)) {
                     mLastTrack->skipTrack = true;
                 }
+
+                status_t err = verifyTrack(mLastTrack);
+                if (err != OK) {
+                    mLastTrack->skipTrack = true;
+                }
+
                 if (mLastTrack->skipTrack) {
                     Track *cur = mFirstTrack;
 
@@ -990,12 +1003,6 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
                     }
 
                     return OK;
-                }
-
-                status_t err = verifyTrack(mLastTrack);
-
-                if (err != OK) {
-                    return err;
                 }
             } else if (chunk_type == FOURCC('m', 'o', 'o', 'v')) {
                 mInitCheck = OK;
@@ -2025,7 +2032,10 @@ status_t MPEG4Extractor::parseChunk(off64_t *offset, int depth) {
             if (mLastTrack == NULL) {
                 return ERROR_MALFORMED;
             }
-            parseSegmentIndex(data_offset, chunk_data_size);
+            status_t err = parseSegmentIndex(data_offset, chunk_data_size);
+            if (err != OK) {
+                return err;
+            }
             *offset += chunk_size;
             return UNKNOWN_ERROR; // stop parsing after sidx
         }
@@ -2388,6 +2398,7 @@ status_t MPEG4Extractor::parseMetaData(off64_t offset, size_t size) {
                     if (sscanf(mLastCommentData,
                                " %*x %x %x %*x", &delay, &padding) == 2) {
                         if (mLastTrack == NULL) {
+                            delete[] buffer;
                             return ERROR_MALFORMED;
                         }
                         mLastTrack->meta->setInt32(kKeyEncoderDelay, delay);
@@ -2469,9 +2480,13 @@ sp<MediaSource> MPEG4Extractor::getTrack(size_t index) {
 
     ALOGV("getTrack called, pssh: %d", mPssh.size());
 
-    return new MPEG4Source(
+    sp<MPEG4Source> source =  new MPEG4Source(
             track->meta, mDataSource, track->timescale, track->sampleTable,
             mSidxEntries, mMoofOffset);
+    if (source->init() != OK) {
+        return NULL;
+    }
+    return source;
 }
 
 // static
@@ -2675,6 +2690,7 @@ MPEG4Source::MPEG4Source(
       mSegments(sidx),
       mFirstMoofOffset(firstMoofOffset),
       mCurrentMoofOffset(firstMoofOffset),
+      mNextMoofOffset(-1),
       mCurrentTime(0),
       mCurrentSampleInfoAllocSize(0),
       mCurrentSampleInfoSizes(NULL),
@@ -2728,10 +2744,14 @@ MPEG4Source::MPEG4Source(
 
     CHECK(format->findInt32(kKeyTrackID, &mTrackId));
 
+}
+
+status_t MPEG4Source::init() {
     if (mFirstMoofOffset != 0) {
         off64_t offset = mFirstMoofOffset;
-        parseChunk(&offset);
+        return parseChunk(&offset);
     }
+    return OK;
 }
 
 MPEG4Source::~MPEG4Source() {
@@ -2850,6 +2870,8 @@ status_t MPEG4Source::parseChunk(off64_t *offset) {
                 // *offset points to the mdat box following this moof
                 parseChunk(offset); // doesn't actually parse it, just updates offset
                 mNextMoofOffset = *offset;
+            } else if (chunk_size == 0) {
+                break;
             }
             break;
         }
@@ -3714,11 +3736,27 @@ status_t MPEG4Source::fragmentedRead(
                 totalTime += se->mDurationUs;
                 totalOffset += se->mSize;
             }
-        mCurrentMoofOffset = totalOffset;
-        mCurrentSamples.clear();
-        mCurrentSampleIndex = 0;
-        parseChunk(&totalOffset);
-        mCurrentTime = totalTime * mTimescale / 1000000ll;
+            mCurrentMoofOffset = totalOffset;
+            mNextMoofOffset = -1;
+            mCurrentSamples.clear();
+            mCurrentSampleIndex = 0;
+            status_t err = parseChunk(&totalOffset);
+            if (err != OK) {
+                return err;
+            }
+            mCurrentTime = totalTime * mTimescale / 1000000ll;
+        } else {
+            // without sidx boxes, we can only seek to 0
+            mCurrentMoofOffset = mFirstMoofOffset;
+            mNextMoofOffset = -1;
+            mCurrentSamples.clear();
+            mCurrentSampleIndex = 0;
+            off64_t tmp = mCurrentMoofOffset;
+            status_t err = parseChunk(&tmp);
+            if (err != OK) {
+                return err;
+            }
+            mCurrentTime = 0;
         }
 
         if (mBuffer != NULL) {
@@ -3744,10 +3782,13 @@ status_t MPEG4Source::fragmentedRead(
             mCurrentMoofOffset = nextMoof;
             mCurrentSamples.clear();
             mCurrentSampleIndex = 0;
-            parseChunk(&nextMoof);
-                if (mCurrentSampleIndex >= mCurrentSamples.size()) {
-                    return ERROR_END_OF_STREAM;
-                }
+            status_t err = parseChunk(&nextMoof);
+            if (err != OK) {
+                return err;
+            }
+            if (mCurrentSampleIndex >= mCurrentSamples.size()) {
+               return ERROR_END_OF_STREAM;
+            }
         }
 
         const Sample *smpl = &mCurrentSamples[mCurrentSampleIndex];
